@@ -349,10 +349,83 @@ def iracing_udp_listener(controller):
         logging.error(f"iRacing listener error: {e}")
 
 # --------------------------- Web Server ------------------------------------
-_HTML = """<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'><title>Traffic Light</title><meta name='viewport' content='width=device-width,initial-scale=1'><style>:root{--bg:#111317;--panel:#1a1d23;--txt:#e0e0e0;--mute:#777;--accent:#007bff}body{background:var(--bg);font-family:Arial;margin:0;display:flex;align-items:center;justify-content:center;height:100vh;color:var(--txt)}.wrap{max-width:380px;padding:20px}.panel{background:var(--panel);border-radius:24px;padding:24px;display:flex;flex-direction:column;gap:20px;border:1px solid #333;box-shadow:0 6px 18px rgba(0,0,0,.55)}.lights{display:flex;flex-direction:column;align-items:center;gap:16px}.light{width:95px;height:95px;border-radius:50%;background:#2b2f37;opacity:.35;transition:.18s;box-shadow:inset 0 3px 12px rgba(0,0,0,.55);cursor:pointer}.red-on{background:#ff1c1c;opacity:1;box-shadow:0 0 42px #ff1c1c,inset 0 3px 14px rgba(0,0,0,.55)}.yellow-on{background:#ffc700;opacity:1;box-shadow:0 0 42px #ffc700,inset 0 3px 14px rgba(0,0,0,.55)}.green-on{background:#00ff38;opacity:1;box-shadow:0 0 42px #00ff38,inset 0 3px 14px rgba(0,0,0,.55)}h2{margin:0;font-size:1.1rem;text-align:center}#info{min-height:22px;font-style:italic;color:var(--mute);text-align:center}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.grid a{background:#2b2f37;color:var(--txt);padding:9px 8px;text-decoration:none;border-radius:12px;text-align:center;font-weight:600;font-size:.8rem;transition:.15s}.grid a:active{transform:scale(.94)}.grid a.active{background:var(--accent);color:#fff}</style></head><body><div class='wrap'><div class='panel'><div class='lights'><div id='red' class='light' onclick=\"setColor('red')\"></div><div id='yellow' class='light' onclick=\"setColor('yellow')\"></div><div id='green' class='light' onclick=\"setColor('green')\"></div></div><h2 id='mode'>Mode: <strong></strong></h2><div id='info'></div><div class='grid'>"""
-for m in ["auto","emergency","sos","party","s_bahn","biergarten","racing","stau","space"]:
-    _HTML += f"<a href='#' id='mode-{m}' onclick=\"setMode('{m}')\">{m.title().replace('_',' ')}"+"</a>"
-_HTML += """</div></div></div><script>let current='unknown',anim=null;function upd(c,mode,mins,w,r,sw,t){if(current!==mode){document.querySelectorAll('.grid a.active').forEach(a=>a.classList.remove('active'));if(mode!=='idle'&&mode!=='manual'){let el=document.getElementById('mode-'+mode);if(el)el.classList.add('active');}}current=mode;document.querySelector('#mode strong').textContent=(mode==='idle')?'OFF':mode.toUpperCase().replace('_',' ');let info=document.getElementById('info');if(mode==='s_bahn'){info.textContent=(mins===-1)?'No S-Bahn data':('Train in '+mins+' min')}else if(mode==='biergarten'){info.textContent=(w&&w.temp)?(w.temp.toFixed(1)+'°C '+w.condition):'No weather'}else if(mode==='racing'&&r>=4){info.textContent='iRacing live'}else if(mode==='space'){info.textContent=(sw&&sw.kp_index!==undefined)?('Kp '+sw.kp_index+' '+sw.condition):'No space data'}else if(mode==='stau'){info.textContent=(t&&t.commute_time)?('Commute '+t.commute_time):'No traffic'}else info.textContent='';let red=(c==='red'||c==='red_and_yellow'||c==='all_on');let yellow=(c==='yellow'||c==='red_and_yellow'||c==='all_on'||c==='green-yellow');let green=(c==='green'||c==='all_on'||c==='green-yellow');document.getElementById('red').className='light'+(red?' red-on':'');document.getElementById('yellow').className='light'+(yellow?' yellow-on':'');document.getElementById('green').className='light'+(green?' green-on':'');}function stopAnim(){if(anim){clearInterval(anim);clearTimeout(anim);anim=null}}function setColor(c){stopAnim();fetch('/?action=set_color&color='+c)}function setMode(m){let off=(current===m);stopAnim();fetch('/?action=set_mode&mode='+m);if(!off){if(m==='party'){anim=setInterval(()=>{upd(['red','yellow','green','off'][Math.floor(Math.random()*4)],'party',-1,{},0,{},{});},80)}else if(m==='sos'){let p=[['all_on',200],['off',200],['all_on',200],['off',200],['all_on',200],['off',400],['all_on',600],['off',200],['all_on',600],['off',200],['all_on',600],['off',400],['all_on',200],['off',200],['all_on',200],['off',200],['all_on',200],['off',1500]];let i=0;function s(){if(current!=='sos')return;let st=p[i];upd(st[0],'sos',-1,{},0,{},{});i=(i+1)%p.length;anim=setTimeout(s,st[1])}s()}}}async function poll(){if(anim)return;try{let r=await fetch('/status');let j=await r.json();upd(j.color,j.mode,j.s_bahn_minutes,j.weather,j.race_step,j.space_weather,j.traffic)}catch(e){} }setInterval(poll,400);poll();</script></body></html>"""
+_HTML = f"""
+    <!DOCTYPE html><html lang="en"><head><title>Traffic Light Control</title><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>:root{{--bg-color:#1a1d23;--body-bg:#111317;--text-color:#e0e0e0;--text-muted:#888;--accent-color:#007bff;--shadow-color:rgba(0,0,0,0.5)}}html,body{{height:100%;margin:0;padding:0;background-color:var(--body-bg);font-family:'Inter',sans-serif;color:var(--text-color);-webkit-tap-highlight-color:transparent;display:flex;justify-content:center;align-items:center}}.container{{width:100%;max-width:380px;padding:20px;box-sizing:border-box;display:flex;flex-direction:column;align-items:center;gap:25px}}.traffic-light-body{{background-color:var(--bg-color);border-radius:24px;padding:20px;display:flex;flex-direction:column;gap:15px;border:1px solid #333;box-shadow:0 10px 30px var(--shadow-color)}}.light{{width:90px;height:90px;border-radius:50%;background-color:#333;opacity:0.5;transition:all .15s ease-in-out;cursor:pointer;box-shadow:inset 0 2px 10px rgba(0,0,0,.4)}}.red-on{{background-color:#ff1c1c;opacity:1;box-shadow:0 0 40px #ff1c1c,inset 0 2px 10px rgba(0,0,0,.4)}}.yellow-on{{background-color:#ffc700;opacity:1;box-shadow:0 0 40px #ffc700,inset 0 2px 10px rgba(0,0,0,.4)}}.green-on{{background-color:#00ff00;opacity:1;box-shadow:0 0 40px #00ff00,inset 0 2px 10px rgba(0,0,0,.4)}}.controls{{text-align:center;width:100%}}#modeText{{font-size:1.5em;font-weight:600;margin-top:0;margin-bottom:8px}}.info-text{{height:22px;font-size:1em;font-style:italic;color:var(--text-muted);margin-bottom:20px}}.mode-buttons{{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;width:100%}}.mode-buttons a{{background-color:#333;color:var(--text-color);padding:12px 10px;border-radius:12px;font-size:1em;font-weight:600;text-decoration:none;transition:background-color .2s,transform .1s}}.mode-buttons a:active{{transform:scale(.95)}}.mode-buttons a.active{{background-color:var(--accent-color);color:#fff}}</style></head>
+    <body><div class="container"><div class="traffic-light-body" id="traffic-light"><div id="red" class="light" onclick="handleLightClick('red')"></div><div id="yellow" class="light" onclick="handleLightClick('yellow')"></div><div id="green" class="light" onclick="handleLightClick('green')"></div></div><div class="controls"><h2 id="modeText">Current Mode: <strong></strong></h2><div id="info-display" class="info-text"></div><div class="mode-buttons"><a href="#" id="mode-auto" onclick="handleModeClick('auto')">Auto</a><a href="#" id="mode-emergency" onclick="handleModeClick('emergency')">Emergency</a><a href="#" id="mode-sos" onclick="handleModeClick('sos')">SOS</a><a href="#" id="mode-party" onclick="handleModeClick('party')">Party</a><a href="#" id="mode-s_bahn" onclick="handleModeClick('s_bahn')">S-Bahn</a><a href="#" id="mode-biergarten" onclick="handleModeClick('biergarten')">Biergarten</a><a href="#" id="mode-racing" onclick="handleModeClick('racing')">Racing</a><a href="#" id="mode-stau" onclick="handleModeClick('stau')">Stau</a><a href="#" id="mode-space" onclick="handleModeClick('space')">Space</a></div></div></div>
+    <script>
+        let currentModeFromServer = 'unknown'; let localAnimationId = null;
+        function updateVisuals(color, mode, s_bahn_minutes, weather, race_step, space_weather, traffic) {{
+            if (currentModeFromServer !== mode) {{
+                const currentActive = document.querySelector('.mode-buttons a.active');
+                if (currentActive) currentActive.classList.remove('active');
+                if (mode !== 'idle' && mode !== 'manual') {{
+                    const newActive = document.getElementById(`mode-${{mode}}`);
+                    if (newActive) newActive.classList.add('active');
+                }}
+            }}
+            currentModeFromServer = mode;
+            document.querySelector('#modeText strong').textContent = (mode === 'idle') ? 'OFF' : mode.replace('_', ' ').toUpperCase();
+            const infoDisplay = document.getElementById('info-display');
+            if (mode === 's_bahn') {{ infoDisplay.textContent = (s_bahn_minutes === -1) ? 'No S-Bahn data.' : `Next train in ${{s_bahn_minutes}} min.`; }}
+            else if (mode === 'biergarten') {{
+                if (weather && weather.temp && weather.condition) {{ infoDisplay.textContent = `${{weather.temp.toFixed(1)}}°C, ${{weather.condition}}`; }}
+                else {{ infoDisplay.textContent = 'No weather data.'; }}
+            }}
+            else if (mode === 'racing' && race_step >= 4) {{ infoDisplay.textContent = 'Listening for iRacing...'; }}
+            else if (mode === 'space') {{
+                if (space_weather && space_weather.kp_index !== undefined) {{ infoDisplay.textContent = `Kp-index: ${{space_weather.kp_index}} (${{space_weather.condition}})`; }}
+                else {{ infoDisplay.textContent = 'No space weather data.'; }}
+            }}
+            else if (mode === 'stau') {{
+                if (traffic && traffic.commute_time) {{ infoDisplay.textContent = `Commute: ${{traffic.commute_time}}`; }}
+                else {{ infoDisplay.textContent = 'No traffic data.'; }}
+            }}
+            else {{ infoDisplay.textContent = ''; }}
+            const isRedOn = color === 'red' || color === 'red_and_yellow' || color === 'all_on';
+            const isYellowOn = color === 'yellow' || color === 'red_and_yellow' || color === 'all_on' || color === 'green-yellow';
+            const isGreenOn = color === 'green' || color === 'all_on' || color === 'green-yellow';
+            document.getElementById('red').className = 'light' + (isRedOn ? ' red-on' : '');
+            document.getElementById('yellow').className = 'light' + (isYellowOn ? ' yellow-on' : '');
+            document.getElementById('green').className = 'light' + (isGreenOn ? ' green-on' : '');
+        }}
+        function stopLocalAnimation() {{ if (localAnimationId) {{ clearInterval(localAnimationId); clearTimeout(localAnimationId); localAnimationId = null; }} }}
+        function startPartyAnimation() {{ stopLocalAnimation(); localAnimationId = setInterval(() => {{ const colors = ['red', 'yellow', 'green', 'off']; updateVisuals(colors[Math.floor(Math.random() * colors.length)], 'party', -1, {{}}, 0, {{}}, {{}}); }}, 80); }}
+        function startSosAnimation() {{
+            stopLocalAnimation();
+            const sosPattern = [
+                {{state: 'all_on', duration: 200}}, {{state: 'off', duration: 200}},{{state: 'all_on', duration: 200}}, {{state: 'off', duration: 200}},{{state: 'all_on', duration: 200}}, {{state: 'off', duration: 400}},
+                {{state: 'all_on', duration: 600}}, {{state: 'off', duration: 200}},{{state: 'all_on', duration: 600}}, {{state: 'off', duration: 200}},{{state: 'all_on', duration: 600}}, {{state: 'off', duration: 400}},
+                {{state: 'all_on', duration: 200}}, {{state: 'off', duration: 200}},{{state: 'all_on', 'duration': 200}}, {{state: 'off', duration: 200}},{{state: 'all_on', duration: 200}}, {{state: 'off', duration: 1500}},
+            ];
+            let sosIndex = 0;
+            function runSosStep() {{
+                if (currentModeFromServer !== 'sos') return;
+                const step = sosPattern[sosIndex]; updateVisuals(step.state, 'sos', -1, {{}}, 0, {{}}, {{}});
+                sosIndex = (sosIndex + 1) % sosPattern.length;
+                localAnimationId = setTimeout(runSosStep, step.duration);
+            }}
+            runSosStep();
+        }}
+        function handleLightClick(color) {{ stopLocalAnimation(); fetch(`/?action=set_color&color=${{color}}`); }}
+        function handleModeClick(mode) {{
+            const isTogglingOff = currentModeFromServer === mode;
+            stopLocalAnimation(); fetch(`/?action=set_mode&mode=${{mode}}`);
+            if (!isTogglingOff) {{ if (mode === 'party') startPartyAnimation(); else if (mode === 'sos') startSosAnimation(); }}
+        }}
+        async function syncWithServer() {{
+            if (localAnimationId) return;
+            try {{
+                const response = await fetch('/status');
+                const status = await response.json();
+                updateVisuals(status.color, status.mode, status.s_bahn_minutes, status.weather, status.race_step, status.space_weather, status.traffic);
+            }} catch (e) {{}}
+        }}
+        setInterval(syncWithServer, 400);
+        syncWithServer();
+    </script>
+    </body></html>
+    """
 
 class _Handler(BaseHTTPRequestHandler):
     controller: 'TrafficLightController' = None
