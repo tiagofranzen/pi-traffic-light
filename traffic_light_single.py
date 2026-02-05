@@ -20,6 +20,9 @@ from typing import Dict, Optional, Protocol, List, Tuple
 from datetime import datetime, timedelta
 import random
 import socket
+import fcntl
+import struct
+import ipaddress
 import xml.etree.ElementTree as ET
 import requests
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -92,6 +95,7 @@ class SharedState:
     iracing_light_status: str = "black"
     space_weather_status: Dict = field(default_factory=dict)
     traffic_status: Dict = field(default_factory=dict)
+    network_connected: bool = False
     mode_state: Dict = field(default_factory=lambda: {
         'next_auto_state': 'green',
         'sos_index': 0,
@@ -120,6 +124,7 @@ class SharedState:
             'race_step': self.mode_state.get('race_step', 0),
             'space_weather': self.space_weather_status.copy(),
             'traffic': self.traffic_status.copy(),
+            'network_connected': self.network_connected,
         }
 
 # --------------------------- Hardware --------------------------------------
@@ -231,6 +236,49 @@ def handle_stau_mode(controller, elapsed: float) -> Optional[float]:
     else: controller.set_light_state('green')
 
 # --------------------------- Monitors --------------------------------------
+def _get_interface_ipv4(ifname: str) -> Optional[str]:
+    """Return IPv4 address for an interface (Linux), or None."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # SIOCGIFADDR = 0x8915
+        res = fcntl.ioctl(sock.fileno(), 0x8915, struct.pack('256s', ifname[:15].encode('utf-8')))
+        return socket.inet_ntoa(res[20:24])
+    except OSError:
+        return None
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def _is_network_connected() -> bool:
+    """True if any non-loopback interface is up and has a non-link-local IPv4."""
+    try:
+        for ifname in os.listdir('/sys/class/net'):
+            if ifname == 'lo':
+                continue
+            try:
+                with open(f'/sys/class/net/{ifname}/operstate', 'r', encoding='utf-8') as f:
+                    operstate = f.read().strip()
+                if operstate != 'up':
+                    continue
+            except Exception:
+                continue
+
+            ip = _get_interface_ipv4(ifname)
+            if not ip:
+                continue
+            try:
+                addr = ipaddress.ip_address(ip)
+                if addr.version == 4 and not addr.is_link_local:
+                    return True
+            except ValueError:
+                continue
+    except Exception:
+        return False
+    return False
+
 # S-Bahn
 
 def _get_next_train_minutes() -> Optional[int]:
@@ -516,7 +564,17 @@ class TrafficLightController:
     def run(self):
         logging.info("Controller loop start")
         with self.state.lock:
-            self.set_light_state('green'); self.state.last_state_change_time = time()
+            # Initialize to the requested target mode to avoid a brief startup flash.
+            if self.state.target_mode == 'manual':
+                self.state.current_mode = 'manual'
+                self.set_light_state(self.state.target_manual_color)
+            elif self.state.target_mode == 'idle':
+                self.state.current_mode = 'idle'
+                self.set_light_state('off')
+            else:
+                # Default behavior: start green and let the controller loop/handlers take over.
+                self.set_light_state('green')
+            self.state.last_state_change_time = time()
         while self.state.running:
             slp = CONTROLLER_LOOP_SLEEP
             with self.state.lock:
@@ -564,6 +622,20 @@ def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     logging.info("Starting single-file traffic light")
     ctrl = TrafficLightController(use_mock_hardware=False)
+
+    # Apply network policy immediately (before threads start)
+    try:
+        connected = _is_network_connected()
+        with ctrl.state.lock:
+            ctrl.state.network_connected = connected
+            if connected:
+                ctrl.state.target_mode = 'manual'
+                ctrl.state.target_manual_color = 'off'
+            else:
+                ctrl.state.target_mode = 'auto'
+    except Exception:
+        pass
+
     try:
         ctrl.run_initialization_sequence()
     except Exception as e:
