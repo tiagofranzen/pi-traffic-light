@@ -1,10 +1,10 @@
 # Traffic Light
 
-A real desktop traffic light, wired to a Raspberry Pi, that lights up for
-whatever actually matters that day — a train arriving, a UV warning, a
-storm on the sun, or your team winning. One Python file drives the GPIO
-LEDs and serves a mobile-first web UI to switch modes and watch live state
-from your phone.
+A Raspberry Pi wired to three real LEDs, built to answer the one question
+that actually matters: is it fine, is it about to not be fine, or is it
+already on fire. Trains, UV rays, solar storms, football, your rev
+limiter — doesn't matter what's actually wrong, it all boils down to red,
+yellow, or green in the end.
 
 <p align="center">
   <img src="docs/screenshots/auto.png" width="260" alt="Auto mode">
@@ -12,110 +12,88 @@ from your phone.
   <img src="docs/screenshots/gremio.png" width="260" alt="Grêmio easter egg">
 </p>
 
-## Features
+## What it does
 
-- **12 modes**, each driving red/yellow/green from a different real-world
-  signal — see the table below.
-- **LED value strip** — for modes backed by a real scalar (not just a
-  3-state color), a segmented bar next to the lights shows exactly where
-  the value sits, always tinted to match whatever the main light is
-  currently showing.
-- **Grêmio easter egg** — Grêmio mode reskins the panel in the club's own
-  colors and shows a face (happy / neutral / angry) built right into the
-  lit circle, reacting to the last match result.
-- **Modern mobile web UI** — glass-panel design, icon mode tiles, safe-area
-  aware layout for iPhone home-screen shortcuts, and a live connection
-  indicator.
-- **Real-time, low-overhead updates** — the UI is pushed state over
-  Server-Sent Events instead of polling, so it stays live without hammering
-  the Pi or your phone's battery.
-- **iRacing / SimHub integration** — Racing mode listens for flag colors
-  (and optionally a rev/shift-light percentage) over UDP from a sim rig on
-  the same network.
-- **Single file, no framework** — `traffic_light_single.py` is the whole
-  backend, hardware layer, and web UI (HTML/CSS/JS embedded). Nothing to
-  build; just run it.
+- 12 modes, each an excuse to light up red/yellow/green for a different
+  reason — trains, traffic, weather, UV, solar storms, a microphone, your
+  football team's feelings, or a sim racing rig. Table below.
+- A little segmented bar next to the lights for modes with a real number
+  behind them, so you get more than three levels of "eh."
+- Grêmio mode gets its own face. Happy, neutral, or furious, depending on
+  the last result. This project has its priorities in order.
+- Updates push to the browser over Server-Sent Events instead of polling,
+  because even a novelty desktop light deserves not to murder your
+  phone's battery.
+- One Python file. No framework, no build step, no npm anywhere near this.
+- A SimHub plugin lives in [`simhub-plugin/`](simhub-plugin) so iRacing
+  can yell at the lights directly — flags, or a live shift-light rev bar,
+  over UDP.
 
 ## Modes
 
-| Mode | Lights up based on | Value strip | Needs |
-|---|---|:-:|---|
-| Auto | Fixed red → yellow → green → red+yellow cycle | | |
-| Manual | Whatever color you tap in the UI | | |
-| Emergency | Blinking yellow | | |
-| SOS | Morse-style SOS blink pattern | | |
-| S-Bahn | Minutes until the next train | ✓ | `DB_CLIENT_ID` / `DB_CLIENT_SECRET` |
-| Stau (traffic) | Live commute delay | ✓ | `TOMTOM_API_KEY` (or `GOOGLE_MAPS_API_KEY`) |
-| Biergarten | Temperature, weather, time of day | | `OWM_API_KEY` |
-| UV | Current UV index | ✓ | — (Open-Meteo, free) |
-| Space | Kp geomagnetic index (aurora/storm risk) | ✓ | — (NOAA, free) |
-| Party | Fast random color flicker | | |
-| Racing | Live flag color from iRacing via SimHub (UDP) | ✓ | a SimHub plugin sending UDP to port 9001 |
-| Audio VU | Microphone level, beat-reactive | ✓ | a USB mic + `sounddevice` |
-| Grêmio | Last match result (win/draw/loss) | | — (ESPN, free) |
+| Mode | Lights up for | Needs |
+|---|---|---|
+| Auto | A fixed cycle, for when you just want a metronome | — |
+| Manual | Whatever you tap in the UI | — |
+| Emergency | Blinking yellow | — |
+| SOS | Morse SOS, for when it's actually that bad | — |
+| S-Bahn | Minutes to your next train | Deutsche Bahn API keys |
+| Stau | How bad your commute is right now | TomTom or Google Maps key |
+| Biergarten | Temperature / weather / time of day | OpenWeatherMap key |
+| UV | Current UV index | — |
+| Space | Geomagnetic Kp index (aurora/storm risk) | — |
+| Party | Random color flicker, no logic, no reason | — |
+| Racing | Live flags + rev bar from iRacing, via [`simhub-plugin/`](simhub-plugin) | the plugin, UDP → port 9001 |
+| Audio VU | Mic level | a USB mic |
+| Grêmio | Last match result | — (ESPN) |
 
-Modes without an API key still work — they just won't have live data to
-react to (S-Bahn, Stau, Biergarten specifically need a key to do anything
-useful).
+No API key, no drama — those modes just sit there looking pretty instead
+of doing anything useful.
 
 ## Hardware
 
-Three LEDs (or a relay board) wired to the Pi's GPIO, active-low by default:
+Three LEDs (or a relay board) on the Pi's GPIO, active-low: Red on 22,
+Yellow on 27, Green on 17. Change pins/polarity at the top of
+`traffic_light_single.py`. No Pi, no wiring, wrong pins — it quietly
+switches to fake hardware so the web UI still works and lies to you
+gracefully.
 
-| Color | BCM pin |
-|---|---|
-| Red | 22 |
-| Yellow | 27 |
-| Green | 17 |
-
-Change pins/polarity at the top of `traffic_light_single.py`
-(`RED_PIN`, `YELLOW_PIN`, `GREEN_PIN`, `ACTIVE_HIGH`). If GPIO init fails
-(wrong pins, no Pi, running on a dev machine), it falls back to a mock
-hardware layer automatically so the web UI still works.
-
-## Setup
+## Running the Pi side
 
 ```bash
 git clone https://github.com/tiagofranzen/pi-traffic-light.git
 cd pi-traffic-light
-pip install -r requirements.txt   # add --break-system-packages on newer Raspberry Pi OS
+pip install -r requirements.txt   # add --break-system-packages if Raspberry Pi OS is feeling precious
 python3 traffic_light_single.py
 ```
 
-Open `http://<pi-ip>:8000` — or add it to your iPhone's home screen for a
-full-screen app-like shortcut.
+Open `http://<pi-ip>:8000`. Add it to your phone's home screen if you
+want to pretend it's a real app.
 
-### Environment variables (all optional)
+Optional environment variables, only needed for the modes that ask for a
+key above: `DB_CLIENT_ID` / `DB_CLIENT_SECRET`, `OWM_API_KEY`,
+`TOMTOM_API_KEY` (or `GOOGLE_MAPS_API_KEY` as a fallback),
+`AUDIO_INPUT_DEVICE`.
 
-| Variable | Enables |
-|---|---|
-| `DB_CLIENT_ID`, `DB_CLIENT_SECRET` | S-Bahn mode (Deutsche Bahn API) |
-| `OWM_API_KEY` | Biergarten mode (OpenWeatherMap) |
-| `TOMTOM_API_KEY` | Stau mode + transit commute time (free tier) |
-| `GOOGLE_MAPS_API_KEY` | Stau mode fallback if no TomTom key |
-| `AUDIO_INPUT_DEVICE` | Pick a specific mic for Audio VU (name substring or device index) |
+## Running the SimHub side
 
-## Adding a mode
-
-1. Write `handle_<name>_mode(controller, elapsed)` next to the others —
-   read whatever state you need off `controller.state`, call
-   `controller.set_light_state(color)`, optionally return a custom sleep
-   interval.
-2. Register it in `TrafficLightController.mode_handlers`.
-3. Add a button in the `mode-buttons` grid in `_HTML` (icon + label,
-   `onclick="handleModeClick('name')"`).
-4. If it has a real scalar value worth showing, add a case to
-   `computeBarPct()` in the same file's embedded JS.
+[`simhub-plugin/`](simhub-plugin) is a full SimHub plugin project (.NET
+Framework 4.8, C#, Visual Studio). Open
+`simhub-plugin/Traffic_Light_Plugin.sln`, build it, restart SimHub,
+enable "Traffic Light Plugin (Flags & Revs)" in the plugins list, point
+it at your Pi's IP and port `9001`. Pick flag mode or rev-light mode in
+the settings panel and go find out how far past redline you actually
+are.
 
 ## API
 
 - `GET /` — the web UI
-- `GET /status` — current state as JSON (polling-friendly)
-- `GET /events` — the same state as a Server-Sent Events stream (what the
-  UI actually uses)
-- `GET /?action=set_mode&mode=<name>` — switch mode (repeat to toggle off)
+- `GET /status` — current state as JSON
+- `GET /events` — same state as an SSE stream (what the UI actually uses)
+- `GET /?action=set_mode&mode=<name>` — switch mode
 - `GET /?action=set_color&color=<red|yellow|green>` — manual override
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). Do whatever you want with it, it's a box
+that turns on lights.
