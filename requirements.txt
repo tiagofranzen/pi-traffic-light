@@ -7,6 +7,10 @@ RPi.GPIO>=0.7.1
 # HTTP requests for API calls
 requests>=2.28.0
 
+# Audio VU mode
+sounddevice>=0.4.6
+numpy>=1.23.0
+
 # Testing (optional)
 pytest>=7.0.0
 pytest-cov>=4.0.0
