@@ -1436,7 +1436,7 @@ class _Handler(BaseHTTPRequestHandler):
                 else:
                     self.wfile.write(b": ping\n\n")
                 self.wfile.flush()
-                sleep(0.3)
+                sleep(0.05)
         except (BrokenPipeError, ConnectionResetError):
             pass
     def _index(self,p):
