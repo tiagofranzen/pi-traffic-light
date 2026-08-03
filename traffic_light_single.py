@@ -1084,25 +1084,25 @@ def iracing_udp_listener(controller):
 _HTML = f"""
     <!DOCTYPE html><html lang="en"><head><title>Traffic Light Control</title><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"><meta name="theme-color" content="#0d0f13"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="Traffic Light">
     <style>
-    :root{{--page-bg-1:#0d0f13;--page-bg-2:#161a22;--panel:rgba(26,29,35,.72);--panel-border:rgba(255,255,255,.08);--text-color:#eef0f2;--text-muted:#8b909a;--accent-color:#2f9bff;--accent-glow:rgba(47,155,255,.35);--ok:#00e08a;--warn:#ffb020;--shadow-color:rgba(0,0,0,.45)}}
+    :root{{--page-bg-1:#0d0f13;--page-bg-2:#161a22;--surface:#15171b;--panel-border:rgba(255,255,255,.08);--text-color:#eef0f2;--text-muted:#8b909a;--ok:#00e08a;--warn:#ffb020}}
     *{{box-sizing:border-box;-webkit-tap-highlight-color:transparent}}
     html,body{{height:100%;margin:0;padding:0;background:var(--page-bg-1)}}
     body{{min-height:100dvh;background:radial-gradient(1200px 600px at 50% -10%,rgba(47,155,255,.10),transparent 60%),linear-gradient(180deg,var(--page-bg-1),var(--page-bg-2));font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:var(--text-color);display:flex;justify-content:center;padding:max(env(safe-area-inset-top),20px) 16px max(env(safe-area-inset-bottom),24px)}}
     .container{{width:100%;max-width:380px;display:flex;flex-direction:column;gap:20px}}
     .topbar{{display:flex;align-items:center;justify-content:space-between;padding:2px 4px}}
     .brand{{font-weight:700;font-size:1.05em;letter-spacing:-.01em}}
-    .conn-pill{{display:flex;align-items:center;gap:6px;font-size:.78em;font-weight:600;color:var(--text-muted);background:rgba(255,255,255,.06);border:1px solid var(--panel-border);border-radius:999px;padding:5px 11px 5px 8px;transition:background .25s,color .25s}}
-    .conn-dot{{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px var(--ok)}}
-    .conn-pill.live{{color:#bfe9d6}}
+    .conn-pill{{display:flex;align-items:center;gap:6px;font-size:.78em;font-weight:600;color:var(--text-muted);transition:color .25s}}
+    .conn-dot{{width:7px;height:7px;border-radius:50%;background:var(--ok)}}
+    .conn-pill.live{{color:#7fbf9f}}
     .conn-pill.lost{{color:#ffd9a0}}
-    .conn-pill.lost .conn-dot{{background:var(--warn);box-shadow:0 0 6px var(--warn);animation:pulse 1s infinite}}
+    .conn-pill.lost .conn-dot{{background:var(--warn);animation:pulse 1s infinite}}
     @keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.3}}}}
-    .glass-card{{background:var(--panel);backdrop-filter:blur(20px) saturate(160%);-webkit-backdrop-filter:blur(20px) saturate(160%);border:1px solid var(--panel-border);border-radius:28px;padding:26px 22px 22px;box-shadow:0 20px 50px var(--shadow-color),inset 0 1px 0 rgba(255,255,255,.05);display:flex;flex-direction:column;align-items:center;gap:16px}}
-    .traffic-light-body{{position:relative;background:linear-gradient(180deg,#181c24,#111318);border-radius:26px;padding:20px 22px;display:flex;flex-direction:column;gap:14px;border:1px solid rgba(255,255,255,.06);box-shadow:inset 0 2px 6px rgba(0,0,0,.5),0 6px 18px rgba(0,0,0,.4)}}
+    .glass-card{{background:var(--surface);border:1px solid var(--panel-border);border-radius:18px;padding:24px 20px 20px;display:flex;flex-direction:column;align-items:center;gap:16px}}
+    .traffic-light-body{{position:relative;padding:18px 20px;display:flex;flex-direction:column;gap:14px;border-radius:20px;border:1px solid transparent}}
     .light{{position:relative;width:86px;height:86px;border-radius:50%;background:#2a2d33;opacity:.4;transition:all .18s cubic-bezier(.4,0,.2,1);cursor:pointer;touch-action:manipulation;box-shadow:inset 0 2px 10px rgba(0,0,0,.5)}}
-    .red-on{{background:#ff2b2b;opacity:1;box-shadow:0 0 36px 4px rgba(255,43,43,.55),inset 0 2px 10px rgba(0,0,0,.4)}}
-    .yellow-on{{background:#ffcb2e;opacity:1;box-shadow:0 0 36px 4px rgba(255,203,46,.5),inset 0 2px 10px rgba(0,0,0,.4)}}
-    .green-on{{background:#2bd672;opacity:1;box-shadow:0 0 36px 4px rgba(43,214,114,.5),inset 0 2px 10px rgba(0,0,0,.4)}}
+    .red-on{{background:#ff2b2b;opacity:1;box-shadow:0 0 16px 2px rgba(255,43,43,.55),inset 0 2px 10px rgba(0,0,0,.4)}}
+    .yellow-on{{background:#ffcb2e;opacity:1;box-shadow:0 0 16px 2px rgba(255,203,46,.5),inset 0 2px 10px rgba(0,0,0,.4)}}
+    .green-on{{background:#2bd672;opacity:1;box-shadow:0 0 16px 2px rgba(43,214,114,.5),inset 0 2px 10px rgba(0,0,0,.4)}}
     .controls{{text-align:center;width:100%}}
     #modeText{{font-size:.72em;font-weight:700;letter-spacing:.12em;color:var(--text-muted);text-transform:uppercase;margin:0}}
     #modeText strong{{display:block;font-size:1.6em;letter-spacing:0;color:var(--text-color);margin-top:3px}}
@@ -1113,17 +1113,16 @@ _HTML = f"""
     .mode-buttons a:active{{transform:scale(.94)}}
     .mode-buttons a svg{{width:20px;height:20px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}}
     .mode-buttons a span{{font-size:.68em;font-weight:600;letter-spacing:.01em}}
-    .mode-buttons a.active{{background:linear-gradient(180deg,rgba(47,155,255,.28),rgba(47,155,255,.14));border-color:rgba(47,155,255,.55);color:#fff;box-shadow:0 0 0 1px rgba(47,155,255,.25),0 4px 14px var(--accent-glow)}}
+    .mode-buttons a.active{{background:rgba(255,255,255,.06);border-color:#4a4d55;color:#f1f2f4}}
     .stage{{position:relative;width:fit-content;margin:0 auto}}
-    .led-strip{{position:absolute;top:0;bottom:0;left:100%;margin-left:14px;width:26px;display:flex;flex-direction:column-reverse;gap:4px;padding:8px 6px;background:rgba(0,0,0,.35);border-radius:10px;border:1px solid var(--panel-border);opacity:0;pointer-events:none;transition:opacity .15s}}
+    .led-strip{{position:absolute;top:0;bottom:0;left:100%;margin-left:14px;width:16px;display:flex;flex-direction:column-reverse;gap:4px;padding:2px;opacity:0;pointer-events:none;transition:opacity .15s}}
     .led-strip.visible{{opacity:1}}
-    .led-seg{{flex:1 1 0;border-radius:3px;background:#2a2d33;transition:all .12s}}
-    .led-seg.lit{{box-shadow:0 0 6px var(--glow)}}
+    .led-seg{{flex:1 1 0;border-radius:2px;background:#2a2d33;transition:all .12s}}
     .gremio-stars{{position:absolute;top:-16px;left:50%;transform:translateX(-50%);display:none;gap:8px;align-items:center;justify-content:center;pointer-events:none}}
     .gremio-stars.visible{{display:flex}}
     .gremio-stars svg{{width:12px;height:12px}}
     .traffic-light-body.gremio-theme{{background:#1F1A17;border-color:#0D80BF}}
-    .light.gremio-win-on{{background-color:#0D80BF;opacity:1;box-shadow:0 0 40px #0D80BF,inset 0 2px 10px rgba(0,0,0,.4)}}
+    .light.gremio-win-on{{background-color:#0D80BF;opacity:1;box-shadow:0 0 18px #0D80BF,inset 0 2px 10px rgba(0,0,0,.4)}}
     .gremio-face{{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:60%;height:60%;opacity:0;pointer-events:none;transition:opacity .15s}}
     .gremio-face.visible{{opacity:1}}
     </style></head>
@@ -1136,8 +1135,8 @@ _HTML = f"""
     <div class="section-label">Modes</div>
     <div class="mode-buttons">
     <a href="#" id="mode-auto" onclick="event.preventDefault(); handleModeClick('auto')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></svg><span>Auto</span></a>
-    <a href="#" id="mode-emergency" onclick="event.preventDefault(); handleModeClick('emergency')"><svg viewBox="0 0 24 24"><path d="M13 2 4 14h6l-1 8 9-12h-6z"/></svg><span>Emergency</span></a>
-    <a href="#" id="mode-sos" onclick="event.preventDefault(); handleModeClick('sos')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8 9v6M12 9v6M16 9v6"/></svg><span>SOS</span></a>
+    <a href="#" id="mode-emergency" onclick="event.preventDefault(); handleModeClick('emergency')"><svg viewBox="0 0 24 24"><path d="M12 3 2.5 20h19L12 3z"/><path d="M12 9.5v4.5"/><circle cx="12" cy="17" r="1" fill="currentColor" stroke="none"/></svg><span>Emergency</span></a>
+    <a href="#" id="mode-sos" onclick="event.preventDefault(); handleModeClick('sos')"><svg viewBox="0 0 24 24"><circle cx="1" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="3" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="5" cy="12" r="1.1" fill="currentColor" stroke="none"/><path d="M7 12h2.4"/><path d="M10.2 12h2.4"/><path d="M13.4 12h2.4"/><circle cx="18.8" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="20.8" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="22.8" cy="12" r="1.1" fill="currentColor" stroke="none"/></svg><span>SOS</span></a>
     <a href="#" id="mode-s_bahn" onclick="event.preventDefault(); handleModeClick('s_bahn')"><svg viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="14" rx="4"/><path d="M5 14h14M9 18l-2 3M15 18l2 3"/><circle cx="9" cy="10" r="1"/><circle cx="15" cy="10" r="1"/></svg><span>S-Bahn</span></a>
     <a href="#" id="mode-stau" onclick="event.preventDefault(); handleModeClick('stau')"><svg viewBox="0 0 24 24"><path d="M4 16v-3l2-4h12l2 4v3"/><path d="M4 16h16M7 16v2M17 16v2"/><circle cx="7.5" cy="16.5" r=".5"/><circle cx="16.5" cy="16.5" r=".5"/></svg><span>Stau</span></a>
     <a href="#" id="mode-biergarten" onclick="event.preventDefault(); handleModeClick('biergarten')"><svg viewBox="0 0 24 24"><path d="M6 8h9v9a3 3 0 0 1-3 3H9a3 3 0 0 1-3-3z"/><path d="M15 10h2a2 2 0 0 1 0 4h-2"/><path d="M6 8l-1-4M11 8l1-4"/></svg><span>Biergarten</span></a>
@@ -1209,7 +1208,6 @@ _HTML = f"""
                 seg.classList.toggle('lit', lit);
                 seg.style.background = lit ? hex : '#2a2d33';
                 seg.style.opacity = lit ? (0.35 + 0.65 * level) : 1;
-                seg.style.setProperty('--glow', lit ? hex : 'transparent');
             }});
         }}
         function updateVisuals(color, mode, s_bahn_minutes, weather, race_step, space_weather, traffic, audio_level, s_bahn_transit, environment, gremio, iracing_rev_pct) {{
