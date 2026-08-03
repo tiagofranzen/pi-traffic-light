@@ -13,6 +13,7 @@ import os
 import sys
 import signal
 import logging
+import math
 import threading
 from time import time, sleep
 from dataclasses import dataclass, field
@@ -64,19 +65,47 @@ API_TIMEOUT = 15.0
 AUDIO_INPUT_DEVICE = os.getenv("AUDIO_INPUT_DEVICE", "").strip()
 
 # Audio VU tuning - continuous mic-level meter (speech, not music transients).
-# Calibrated live against this Pi's USB mic with Auto Gain Control disabled
-# (AGC was normalizing quiet/loud audio to the same level, killing the dynamic
-# range a VU meter needs): silence measured ~0.006-0.011 RMS (rare noise
-# spikes to ~0.02), a normal-volume speech burst measured ~0.066 RMS.
-AUDIO_VU_NOISE_FLOOR = 0.38
-AUDIO_VU_ATTACK_SECONDS = 0.02
-AUDIO_VU_RELEASE_SECONDS = 0.06
+# Auto Gain Control on the USB mic was normalizing quiet/loud audio to nearly
+# the same level, killing the dynamic range a VU meter needs - disable it at
+# the ALSA level (amixer -c <card> sset 'Auto Gain Control' off; persist with
+# alsactl store) before this will read sensibly.
+#
+# Level is normalized against a self-adjusting noise floor (an auto-ranging
+# noise gate, not a fixed reference level) so it re-calibrates to whatever
+# room/mic gain it's running in instead of needing a hand-measured constant:
+#   - floor tracks the recent quiet-est level: snaps down fast, creeps up slow.
+#   - ceiling is derived from the floor by a fixed ratio, not tracked
+#     independently - two separately-adaptive envelopes chase each other with
+#     nothing to anchor the ceiling during quiet stretches (measured this
+#     going unstable: ambient alone dragged the ceiling down until ordinary
+#     room noise read as "loud"). A floor-relative gate is the standard,
+#     boring, stable version of this (same idea real noise gates use).
+#   - displayed level = (raw - floor) / (floor*ratio - floor), clamped 0..1.
+# Measured on this Pi's mic with AGC off: silence ~0.006-0.011 RMS, a normal
+# speech burst ~0.066 RMS - ratio of ~8-9x sets AUDIO_VU_CEILING_RATIO below.
+AUDIO_VU_FLOOR_SEED = 0.008
+AUDIO_VU_FLOOR_TAU_DOWN = 1.2   # seconds to mostly settle onto a new, quieter floor
+AUDIO_VU_FLOOR_TAU_UP = 8.0     # seconds to drift the floor up if the room gets noisier
+AUDIO_VU_CEILING_RATIO = 9.0    # "loud" = floor * this
+AUDIO_VU_MIN_RANGE = 0.05       # floor..ceiling floor - guards near-zero floor
+
+# Hysteresis bands on the normalized 0..1 scale: separate enter/exit thresholds
+# per color so hovering near a boundary can't flap the relay back and forth
+# (a Schmitt trigger, same trick used in real VU meters and noise gates).
+AUDIO_VU_ENTER_GREEN = 0.16
+AUDIO_VU_EXIT_GREEN = 0.08
+AUDIO_VU_ENTER_YELLOW = 0.50
+AUDIO_VU_EXIT_YELLOW = 0.36
+AUDIO_VU_ENTER_ALL = 0.82
+AUDIO_VU_EXIT_ALL = 0.66
+
 AUDIO_VU_STALE_SECONDS = 0.12
 AUDIO_VU_MODE_LOOP_SECONDS = 0.02
 AUDIO_VU_SMOOTHING_ATTACK = 0.30
 AUDIO_VU_SMOOTHING_RELEASE = 0.82
-AUDIO_VU_REFERENCE_LEVEL = 0.10
-AUDIO_VU_RELAY_IGNORE_SECONDS = 0.25
+# Relay click decays to baseline within ~120-200ms (measured); mute the level
+# tracker for longer than that so the click's own noise never reaches it.
+AUDIO_VU_RELAY_IGNORE_SECONDS = 0.30
 AUDIO_VU_MIN_STEP_SECONDS = 0.09
 
 # Location / routes
@@ -160,10 +189,10 @@ class SharedState:
             {'state': 'all_on', 'duration': 0.2}, {'state': 'off', 'duration': 1.5},
         ],
         'audio_vu_last': 0.0,
-        'audio_vu_above_since': None,
-        'audio_vu_below_since': None,
         'audio_vu_ignore_until': 0.0,
         'audio_vu_last_step_time': 0.0,
+        'audio_vu_floor': AUDIO_VU_FLOOR_SEED,
+        'audio_vu_last_update': 0.0,
     })
     lock: threading.RLock = field(default_factory=threading.RLock)
     running: bool = True
@@ -351,39 +380,28 @@ def handle_audio_vu_mode(controller, elapsed: float) -> Optional[float]:
     last = state.mode_state.get('audio_vu_last', 0.0)
     level = state.audio_vu_level if (now - last) <= AUDIO_VU_STALE_SECONDS else 0.0
 
-    above_since = state.mode_state.get('audio_vu_above_since')
-    below_since = state.mode_state.get('audio_vu_below_since')
-    above_floor = level >= AUDIO_VU_NOISE_FLOOR
-
-    if above_floor:
-        if above_since is None:
-            state.mode_state['audio_vu_above_since'] = now
-        state.mode_state['audio_vu_below_since'] = None
-    else:
-        if below_since is None:
-            state.mode_state['audio_vu_below_since'] = now
-        state.mode_state['audio_vu_above_since'] = None
-
-    # Debounce relay click noise: require sustained signal before turning on,
-    # and sustained silence before turning off.
-    if state.current_color == 'off':
-        above_since = state.mode_state.get('audio_vu_above_since')
-        if above_since is None or (now - above_since) < AUDIO_VU_ATTACK_SECONDS:
-            return AUDIO_VU_MODE_LOOP_SECONDS
-    else:
-        below_since = state.mode_state.get('audio_vu_below_since')
-        if below_since is not None and (now - below_since) >= AUDIO_VU_RELEASE_SECONDS:
-            controller.set_light_state('off')
-            return AUDIO_VU_MODE_LOOP_SECONDS
-
-    if level < AUDIO_VU_NOISE_FLOOR:
-        target_color = 'off'
-    elif level < 0.45:
-        target_color = 'green'
-    elif level < 0.80:
-        target_color = 'green-yellow'
-    else:
-        target_color = 'all_on'
+    # Hysteresis (a Schmitt trigger): separate enter/exit thresholds per band,
+    # keyed off the color we're currently sitting in, so a level hovering near
+    # a boundary can't flap the relay back and forth every cycle.
+    color = state.current_color
+    if color == 'off':
+        target_color = 'green' if level >= AUDIO_VU_ENTER_GREEN else 'off'
+    elif color == 'green':
+        if level < AUDIO_VU_EXIT_GREEN:
+            target_color = 'off'
+        elif level >= AUDIO_VU_ENTER_YELLOW:
+            target_color = 'green-yellow'
+        else:
+            target_color = 'green'
+    elif color == 'green-yellow':
+        if level < AUDIO_VU_EXIT_YELLOW:
+            target_color = 'green'
+        elif level >= AUDIO_VU_ENTER_ALL:
+            target_color = 'all_on'
+        else:
+            target_color = 'green-yellow'
+    else:  # all_on
+        target_color = 'all_on' if level >= AUDIO_VU_EXIT_ALL else 'green-yellow'
 
     if target_color != state.current_color:
         last_step = float(state.mode_state.get('audio_vu_last_step_time', 0.0) or 0.0)
@@ -949,19 +967,34 @@ def audio_vu_monitor(controller):
         return None, None
 
     def _update_level(level: float) -> None:
-        raw = min((level / AUDIO_VU_REFERENCE_LEVEL), 1.0)
+        now = time()
         with controller.state.lock:
             # The relay clicks audibly when the light switches - drop samples
             # taken while that click is still ringing out, or the mic picks up
             # its own relay and re-triggers another switch in a feedback loop.
             ignore_until = float(controller.state.mode_state.get('audio_vu_ignore_until', 0.0) or 0.0)
-            if time() < ignore_until:
+            if now < ignore_until:
                 return
-            target = raw
+
+            ms = controller.state.mode_state
+            floor = float(ms.get('audio_vu_floor', AUDIO_VU_FLOOR_SEED) or AUDIO_VU_FLOOR_SEED)
+            last_update = float(ms.get('audio_vu_last_update', now) or now)
+            dt = max(0.0, min(now - last_update, 0.5))
+            ms['audio_vu_last_update'] = now
+
+            # Asymmetric envelope follower: floor snaps down onto quiet fast
+            # but only creeps up slowly - so it settles on "recent quiet",
+            # not an average that a sustained loud stretch would drag upward.
+            floor_tau = AUDIO_VU_FLOOR_TAU_DOWN if level < floor else AUDIO_VU_FLOOR_TAU_UP
+            floor += (level - floor) * (1.0 - math.exp(-dt / floor_tau))
+            ms['audio_vu_floor'] = floor
+
+            ceiling = max(floor * AUDIO_VU_CEILING_RATIO, floor + AUDIO_VU_MIN_RANGE)
+            target = max(0.0, min((level - floor) / (ceiling - floor), 1.0))
             prev = controller.state.audio_vu_level
             smoothing = AUDIO_VU_SMOOTHING_ATTACK if target >= prev else AUDIO_VU_SMOOTHING_RELEASE
             controller.state.audio_vu_level = max(0.0, (prev * smoothing) + (target * (1.0 - smoothing)))
-            controller.state.mode_state['audio_vu_last'] = time()
+            controller.state.mode_state['audio_vu_last'] = now
 
     device_index, device_name = _resolve_input_device()
     if device_index is None:
@@ -1084,8 +1117,8 @@ _HTML = f"""
     <style>
     :root{{--page-bg-1:#0d0f13;--page-bg-2:#161a22;--surface:#15171b;--panel-border:rgba(255,255,255,.08);--text-color:#eef0f2;--text-muted:#8b909a;--ok:#00e08a;--warn:#ffb020}}
     *{{box-sizing:border-box;-webkit-tap-highlight-color:transparent}}
-    html,body{{height:100%;margin:0;padding:0;background:var(--page-bg-1)}}
-    body{{min-height:100dvh;background:radial-gradient(1200px 600px at 50% -10%,rgba(47,155,255,.10),transparent 60%),linear-gradient(180deg,var(--page-bg-1),var(--page-bg-2));font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:var(--text-color);display:flex;justify-content:center;padding:max(env(safe-area-inset-top),20px) 16px max(env(safe-area-inset-bottom),24px)}}
+    html,body{{height:100%;margin:0;padding:0;background:var(--page-bg-2);overscroll-behavior:none}}
+    body{{min-height:100vh;min-height:-webkit-fill-available;min-height:100dvh;background:radial-gradient(1200px 600px at 50% -10%,rgba(47,155,255,.10),transparent 60%),linear-gradient(180deg,var(--page-bg-1),var(--page-bg-2));font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:var(--text-color);display:flex;justify-content:center;padding:max(env(safe-area-inset-top),20px) 16px max(env(safe-area-inset-bottom),24px)}}
     .container{{width:100%;max-width:380px;display:flex;flex-direction:column;gap:20px}}
     .topbar{{display:flex;align-items:center;justify-content:space-between;padding:2px 4px}}
     .brand{{font-weight:700;font-size:1.05em;letter-spacing:-.01em}}
@@ -1585,7 +1618,7 @@ class TrafficLightController:
         elif new_mode == 'racing':
             self.state.mode_state['race_step'] = 0; self.set_light_state('off')
         elif new_mode == 'audio_vu':
-            self.set_light_state('off'); self.state.audio_vu_level = 0.0; self.state.mode_state['audio_vu_last'] = time(); self.state.mode_state['audio_vu_above_since'] = None; self.state.mode_state['audio_vu_below_since'] = None; self.state.mode_state['audio_vu_ignore_until'] = time() + AUDIO_VU_RELAY_IGNORE_SECONDS; self.state.mode_state['audio_vu_last_step_time'] = time()
+            self.set_light_state('off'); self.state.audio_vu_level = 0.0; self.state.mode_state['audio_vu_last'] = time(); self.state.mode_state['audio_vu_ignore_until'] = time() + AUDIO_VU_RELAY_IGNORE_SECONDS; self.state.mode_state['audio_vu_last_step_time'] = time(); self.state.mode_state['audio_vu_floor'] = AUDIO_VU_FLOOR_SEED; self.state.mode_state['audio_vu_last_update'] = 0.0
         elif new_mode == 'idle':
             self.set_light_state('off')
     def shutdown(self):
