@@ -113,9 +113,14 @@ TOMTOM_ROUTING_URL = "https://api.tomtom.com/routing/1/calculateRoute/{loc}/json
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_AIR_QUALITY_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 GREMIO_ESPN_TEAM_ID = "6273"
-GREMIO_ESPN_LEAGUE = "bra.1"
-GREMIO_ESPN_SCHEDULE_URL = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{GREMIO_ESPN_LEAGUE}/teams/{GREMIO_ESPN_TEAM_ID}/schedule"
-GREMIO_ESPN_SCOREBOARD_URL = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{GREMIO_ESPN_LEAGUE}/scoreboard"
+# Every competition Grêmio might be playing in at once: domestic league + the CONMEBOL cups.
+GREMIO_ESPN_LEAGUES = ["bra.1", "bra.copa_do_brazil", "conmebol.libertadores", "conmebol.sudamericana", "conmebol.recopa"]
+
+def _gremio_schedule_url(league: str) -> str:
+    return f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/teams/{GREMIO_ESPN_TEAM_ID}/schedule"
+
+def _gremio_scoreboard_url(league: str) -> str:
+    return f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/scoreboard"
 
 # In-process geocode cache for TomTom (address -> (lat, lon))
 _TOMTOM_GEOCODE_CACHE: Dict[str, Tuple[float, float]] = {}
@@ -812,19 +817,28 @@ def _espn_competitor_score(competitor: Dict) -> int:
 def _fetch_gremio_last_result() -> Dict:
     out: Dict = {}
 
-    # Last completed match from team schedule (events newest-first)
-    try:
-        r = requests.get(GREMIO_ESPN_SCHEDULE_URL, timeout=API_TIMEOUT)
-        r.raise_for_status()
-        for ev in r.json().get('events') or []:
-            comp = (ev.get('competitions') or [{}])[0]
-            if not (comp.get('status') or {}).get('type', {}).get('completed'):
-                continue
-            competitors = comp.get('competitors') or []
-            gremio_c = next((c for c in competitors if 'grêmio' in (c.get('team', {}).get('displayName') or '').lower()), None)
-            opp_c = next((c for c in competitors if c is not gremio_c), None)
-            if not gremio_c or not opp_c:
-                continue
+    # Last completed match, across every tracked competition (each league's
+    # schedule returns events newest-first, so the first completed one per
+    # league is that league's latest - then keep whichever league is newest).
+    best_ev, best_competitors = None, None
+    for league in GREMIO_ESPN_LEAGUES:
+        try:
+            r = requests.get(_gremio_schedule_url(league), timeout=API_TIMEOUT)
+            r.raise_for_status()
+            for ev in r.json().get('events') or []:
+                comp = (ev.get('competitions') or [{}])[0]
+                if not (comp.get('status') or {}).get('type', {}).get('completed'):
+                    continue
+                if best_ev is None or (ev.get('date') or '') > (best_ev.get('date') or ''):
+                    best_ev, best_competitors = ev, comp.get('competitors') or []
+                break
+        except Exception as e:
+            logging.debug(f"Grêmio ESPN schedule fetch failed ({league}): {e}")
+
+    if best_ev is not None:
+        gremio_c = next((c for c in best_competitors if 'grêmio' in (c.get('team', {}).get('displayName') or '').lower()), None)
+        opp_c = next((c for c in best_competitors if c is not gremio_c), None)
+        if gremio_c and opp_c:
             gs = _espn_competitor_score(gremio_c)
             os_ = _espn_competitor_score(opp_c)
             if gremio_c.get('winner'):
@@ -838,33 +852,37 @@ def _fetch_gremio_last_result() -> Dict:
                 'score': f"{gs}-{os_}",
                 'opponent': (opp_c.get('team') or {}).get('displayName', '?'),
                 'home_away': 'home' if gremio_c.get('homeAway') == 'home' else 'away',
-                'date': (ev.get('date') or '')[:10],
-                'competition': (ev.get('league') or {}).get('name'),
+                'date': (best_ev.get('date') or '')[:10],
+                'competition': (best_ev.get('league') or {}).get('name'),
             })
-            break
-    except Exception as e:
-        logging.debug(f"Grêmio ESPN schedule fetch failed: {e}")
 
-    # Next upcoming match (search 60 days ahead on the scoreboard)
-    try:
-        today = datetime.utcnow()
-        end_dt = today + timedelta(days=60)
-        date_range = f"{today.strftime('%Y%m%d')}-{end_dt.strftime('%Y%m%d')}"
-        r = requests.get(GREMIO_ESPN_SCOREBOARD_URL, params={'dates': date_range}, timeout=API_TIMEOUT)
-        r.raise_for_status()
-        for ev in r.json().get('events') or []:
-            comp = (ev.get('competitions') or [{}])[0]
-            competitors = comp.get('competitors') or []
-            gremio_c = next((c for c in competitors if 'grêmio' in (c.get('team', {}).get('displayName') or '').lower()), None)
-            if not gremio_c:
-                continue
-            opp_c = next((c for c in competitors if c is not gremio_c), None)
-            out['next_match_date'] = ev.get('date', '')
-            out['next_match_opponent'] = (opp_c.get('team') or {}).get('displayName', '?') if opp_c else '?'
-            out['next_match_home_away'] = 'home' if gremio_c.get('homeAway') == 'home' else 'away'
-            break
-    except Exception as e:
-        logging.debug(f"Grêmio ESPN next match fetch failed: {e}")
+    # Next upcoming match, across every tracked competition (search 60 days ahead).
+    best_next, best_next_competitors = None, None
+    today = datetime.utcnow()
+    end_dt = today + timedelta(days=60)
+    date_range = f"{today.strftime('%Y%m%d')}-{end_dt.strftime('%Y%m%d')}"
+    for league in GREMIO_ESPN_LEAGUES:
+        try:
+            r = requests.get(_gremio_scoreboard_url(league), params={'dates': date_range}, timeout=API_TIMEOUT)
+            r.raise_for_status()
+            for ev in r.json().get('events') or []:
+                comp = (ev.get('competitions') or [{}])[0]
+                competitors = comp.get('competitors') or []
+                gremio_c = next((c for c in competitors if 'grêmio' in (c.get('team', {}).get('displayName') or '').lower()), None)
+                if not gremio_c:
+                    continue
+                if best_next is None or (ev.get('date') or '') < (best_next.get('date') or ''):
+                    best_next, best_next_competitors = ev, competitors
+                break
+        except Exception as e:
+            logging.debug(f"Grêmio ESPN next match fetch failed ({league}): {e}")
+
+    if best_next is not None:
+        gremio_c = next((c for c in best_next_competitors if 'grêmio' in (c.get('team', {}).get('displayName') or '').lower()), None)
+        opp_c = next((c for c in best_next_competitors if c is not gremio_c), None) if gremio_c else None
+        out['next_match_date'] = best_next.get('date', '')
+        out['next_match_opponent'] = (opp_c.get('team') or {}).get('displayName', '?') if opp_c else '?'
+        out['next_match_home_away'] = 'home' if (gremio_c or {}).get('homeAway') == 'home' else 'away'
 
     return out
 
@@ -1123,7 +1141,7 @@ _HTML = f"""
     .gremio-stars svg{{width:12px;height:12px}}
     .traffic-light-body.gremio-theme{{background:#1F1A17;border-color:#0D80BF}}
     .light.gremio-win-on{{background-color:#0D80BF;opacity:1;box-shadow:0 0 18px #0D80BF,inset 0 2px 10px rgba(0,0,0,.4)}}
-    .gremio-face{{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:60%;height:60%;opacity:0;pointer-events:none;transition:opacity .15s}}
+    .gremio-face{{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:86%;height:86%;opacity:0;pointer-events:none;transition:opacity .15s}}
     .gremio-face.visible{{opacity:1}}
     </style></head>
     <body><div class="container">
@@ -1139,7 +1157,7 @@ _HTML = f"""
     <a href="#" id="mode-sos" onclick="event.preventDefault(); handleModeClick('sos')"><svg viewBox="0 0 24 24"><circle cx="1" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="3" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="5" cy="12" r="1.1" fill="currentColor" stroke="none"/><path d="M7 12h2.4"/><path d="M10.2 12h2.4"/><path d="M13.4 12h2.4"/><circle cx="18.8" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="20.8" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="22.8" cy="12" r="1.1" fill="currentColor" stroke="none"/></svg><span>SOS</span></a>
     <a href="#" id="mode-s_bahn" onclick="event.preventDefault(); handleModeClick('s_bahn')"><svg viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="14" rx="4"/><path d="M5 14h14M9 18l-2 3M15 18l2 3"/><circle cx="9" cy="10" r="1"/><circle cx="15" cy="10" r="1"/></svg><span>S-Bahn</span></a>
     <a href="#" id="mode-stau" onclick="event.preventDefault(); handleModeClick('stau')"><svg viewBox="0 0 24 24"><path d="M4 16v-3l2-4h12l2 4v3"/><path d="M4 16h16M7 16v2M17 16v2"/><circle cx="7.5" cy="16.5" r=".5"/><circle cx="16.5" cy="16.5" r=".5"/></svg><span>Stau</span></a>
-    <a href="#" id="mode-biergarten" onclick="event.preventDefault(); handleModeClick('biergarten')"><svg viewBox="0 0 24 24"><path d="M6 8h9v9a3 3 0 0 1-3 3H9a3 3 0 0 1-3-3z"/><path d="M15 10h2a2 2 0 0 1 0 4h-2"/><path d="M6 8l-1-4M11 8l1-4"/></svg><span>Biergarten</span></a>
+    <a href="#" id="mode-biergarten" onclick="event.preventDefault(); handleModeClick('biergarten')"><svg viewBox="0 0 24 24"><path d="M8 6h9v13a2 2 0 0 1-2 2h-5a2 2 0 0 1-2-2z"/><path d="M8 10h9"/><path d="M17 9c3 0 3 6 0 6"/><path d="M9 6q3-3 6 0"/></svg><span>Biergarten</span></a>
     <a href="#" id="mode-uv" onclick="event.preventDefault(); handleModeClick('uv')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 3v2M12 19v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M3 12h2M19 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"/></svg><span>UV</span></a>
     <a href="#" id="mode-space" onclick="event.preventDefault(); handleModeClick('space')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><ellipse cx="12" cy="12" rx="9" ry="3.2" transform="rotate(35 12 12)"/></svg><span>Space</span></a>
     <a href="#" id="mode-party" onclick="event.preventDefault(); handleModeClick('party')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M6 6l2 2M16 16l2 2M6 18l2-2M16 8l2-2"/></svg><span>Party</span></a>
@@ -1330,19 +1348,19 @@ _HTML = f"""
                 gremioStars.classList.add('visible');
                 const result = (gremio || {{}}).result;
                 const EXPRESSIONS = {{
-                    happy:   {{mouth:'M8,10 Q20,26 32,10', angry:false}},
-                    neutral: {{mouth:'M10,18 L30,18', angry:false}},
-                    angry:   {{mouth:'M8,24 Q20,10 32,24', angry:true}},
+                    happy:   {{mouth:'M12,24 Q20,34 28,24', angry:false}},
+                    neutral: {{mouth:'M12,25 L28,25', angry:false}},
+                    angry:   {{mouth:'M12,29 Q20,20 28,29', angry:true}},
                 }};
                 const key = result === 'win' ? 'happy' : result === 'loss' ? 'angry' : (result === 'draw' ? 'neutral' : null);
                 const activeFace = isGreenOn ? gremioFaces[2] : isYellowOn ? gremioFaces[1] : isRedOn ? gremioFaces[0] : null;
                 if (activeFace && key) {{
                     const e = EXPRESSIONS[key];
-                    const eyeY = e.angry ? 16 : 15;
+                    const eyeY = e.angry ? 15 : 14;
                     const brows = e.angry
-                        ? `<line x1="8" y1="10" x2="15" y2="13" stroke="#fff" stroke-width="3" stroke-linecap="round"/><line x1="32" y1="10" x2="25" y2="13" stroke="#fff" stroke-width="3" stroke-linecap="round"/>`
+                        ? `<line x1="6" y1="7" x2="14" y2="9" stroke="#fff" stroke-width="3.2" stroke-linecap="round"/><line x1="34" y1="7" x2="26" y2="9" stroke="#fff" stroke-width="3.2" stroke-linecap="round"/>`
                         : '';
-                    activeFace.innerHTML = `${{brows}}<circle cx="12" cy="${{eyeY}}" r="2.6" fill="#fff"/><circle cx="28" cy="${{eyeY}}" r="2.6" fill="#fff"/><path d="${{e.mouth}}" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round"/>`;
+                    activeFace.innerHTML = `${{brows}}<circle cx="9" cy="${{eyeY}}" r="3.2" fill="#fff"/><circle cx="31" cy="${{eyeY}}" r="3.2" fill="#fff"/><path d="${{e.mouth}}" fill="none" stroke="#fff" stroke-width="3.2" stroke-linecap="round"/>`;
                     activeFace.classList.add('visible');
                 }}
             }} else {{
