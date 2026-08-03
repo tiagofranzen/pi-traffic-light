@@ -63,21 +63,21 @@ GREMIO_POLL_INTERVAL = 3600.0
 API_TIMEOUT = 15.0
 AUDIO_INPUT_DEVICE = os.getenv("AUDIO_INPUT_DEVICE", "").strip()
 
-# Audio VU tuning
-AUDIO_VU_NOISE_FLOOR = 0.09
+# Audio VU tuning - continuous mic-level meter (speech, not music transients).
+# Calibrated live against this Pi's USB mic with Auto Gain Control disabled
+# (AGC was normalizing quiet/loud audio to the same level, killing the dynamic
+# range a VU meter needs): silence measured ~0.006-0.011 RMS (rare noise
+# spikes to ~0.02), a normal-volume speech burst measured ~0.066 RMS.
+AUDIO_VU_NOISE_FLOOR = 0.38
 AUDIO_VU_ATTACK_SECONDS = 0.02
 AUDIO_VU_RELEASE_SECONDS = 0.06
 AUDIO_VU_STALE_SECONDS = 0.12
 AUDIO_VU_MODE_LOOP_SECONDS = 0.02
-AUDIO_VU_SMOOTHING_ATTACK = 0.05
-AUDIO_VU_SMOOTHING_RELEASE = 0.30
-AUDIO_VU_REFERENCE_LEVEL = 0.28
-AUDIO_VU_RELAY_IGNORE_SECONDS = 0.12
+AUDIO_VU_SMOOTHING_ATTACK = 0.30
+AUDIO_VU_SMOOTHING_RELEASE = 0.82
+AUDIO_VU_REFERENCE_LEVEL = 0.10
+AUDIO_VU_RELAY_IGNORE_SECONDS = 0.25
 AUDIO_VU_MIN_STEP_SECONDS = 0.09
-AUDIO_VU_LOUD_GATE = 0.30
-AUDIO_VU_BEAT_DELTA = 0.14
-AUDIO_VU_BEAT_HOLD_SECONDS = 0.10
-AUDIO_VU_BEAT_MIN_INTERVAL = 0.12
 
 # Location / routes
 WEATHER_LAT = "48.0667"
@@ -164,9 +164,6 @@ class SharedState:
         'audio_vu_below_since': None,
         'audio_vu_ignore_until': 0.0,
         'audio_vu_last_step_time': 0.0,
-        'audio_vu_baseline': 0.0,
-        'audio_vu_last_beat': 0.0,
-        'audio_vu_beat_hold_until': 0.0,
     })
     lock: threading.RLock = field(default_factory=threading.RLock)
     running: bool = True
@@ -901,7 +898,7 @@ def audio_vu_monitor(controller):
         logging.warning("Audio VU disabled: install sounddevice and numpy")
         return
 
-    blocksize = 256
+    blocksize = 1024
 
     def _resolve_input_device() -> Tuple[Optional[int], Optional[str]]:
         try:
@@ -953,35 +950,18 @@ def audio_vu_monitor(controller):
 
     def _update_level(level: float) -> None:
         raw = min((level / AUDIO_VU_REFERENCE_LEVEL), 1.0)
-        now = time()
         with controller.state.lock:
-            baseline = float(controller.state.mode_state.get('audio_vu_baseline', raw) or raw)
-            baseline = (baseline * 0.985) + (raw * 0.015)
-            controller.state.mode_state['audio_vu_baseline'] = baseline
-
-            onset = max(0.0, raw - baseline)
-            last_beat = float(controller.state.mode_state.get('audio_vu_last_beat', 0.0) or 0.0)
-            beat_hold_until = float(controller.state.mode_state.get('audio_vu_beat_hold_until', 0.0) or 0.0)
-
-            is_beat = (
-                raw >= AUDIO_VU_LOUD_GATE
-                and onset >= AUDIO_VU_BEAT_DELTA
-                and (now - last_beat) >= AUDIO_VU_BEAT_MIN_INTERVAL
-            )
-            if is_beat:
-                controller.state.mode_state['audio_vu_last_beat'] = now
-                beat_hold_until = now + AUDIO_VU_BEAT_HOLD_SECONDS
-                controller.state.mode_state['audio_vu_beat_hold_until'] = beat_hold_until
-
-            if now < beat_hold_until:
-                target = max(raw, min(1.0, 0.52 + onset * 2.2))
-            else:
-                target = raw if raw >= AUDIO_VU_LOUD_GATE else 0.0
-
+            # The relay clicks audibly when the light switches - drop samples
+            # taken while that click is still ringing out, or the mic picks up
+            # its own relay and re-triggers another switch in a feedback loop.
+            ignore_until = float(controller.state.mode_state.get('audio_vu_ignore_until', 0.0) or 0.0)
+            if time() < ignore_until:
+                return
+            target = raw
             prev = controller.state.audio_vu_level
             smoothing = AUDIO_VU_SMOOTHING_ATTACK if target >= prev else AUDIO_VU_SMOOTHING_RELEASE
             controller.state.audio_vu_level = max(0.0, (prev * smoothing) + (target * (1.0 - smoothing)))
-            controller.state.mode_state['audio_vu_last'] = now
+            controller.state.mode_state['audio_vu_last'] = time()
 
     device_index, device_name = _resolve_input_device()
     if device_index is None:
@@ -1605,7 +1585,7 @@ class TrafficLightController:
         elif new_mode == 'racing':
             self.state.mode_state['race_step'] = 0; self.set_light_state('off')
         elif new_mode == 'audio_vu':
-            self.set_light_state('off'); self.state.audio_vu_level = 0.0; self.state.mode_state['audio_vu_last'] = time(); self.state.mode_state['audio_vu_above_since'] = None; self.state.mode_state['audio_vu_below_since'] = None; self.state.mode_state['audio_vu_ignore_until'] = time() + AUDIO_VU_RELAY_IGNORE_SECONDS; self.state.mode_state['audio_vu_last_step_time'] = time(); self.state.mode_state['audio_vu_baseline'] = 0.0; self.state.mode_state['audio_vu_last_beat'] = 0.0; self.state.mode_state['audio_vu_beat_hold_until'] = 0.0
+            self.set_light_state('off'); self.state.audio_vu_level = 0.0; self.state.mode_state['audio_vu_last'] = time(); self.state.mode_state['audio_vu_above_since'] = None; self.state.mode_state['audio_vu_below_since'] = None; self.state.mode_state['audio_vu_ignore_until'] = time() + AUDIO_VU_RELAY_IGNORE_SECONDS; self.state.mode_state['audio_vu_last_step_time'] = time()
         elif new_mode == 'idle':
             self.set_light_state('off')
     def shutdown(self):
