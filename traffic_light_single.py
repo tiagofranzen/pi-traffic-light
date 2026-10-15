@@ -15,6 +15,7 @@ import signal
 import logging
 import math
 import threading
+from collections import deque
 from time import time, sleep
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Protocol, List, Tuple
@@ -50,7 +51,6 @@ AUTO_YELLOW_DURATION = 3.0
 AUTO_RED_DURATION = 20.0
 AUTO_RED_YELLOW_DURATION = 2.0
 EMERGENCY_BLINK_INTERVAL = 0.5
-PARTY_BLINK_INTERVAL = 0.08
 CONTROLLER_LOOP_SLEEP = 0.2
 RACING_STEP_DURATION = 1.0
 S_BAHN_POLL_INTERVAL = 30.0
@@ -64,49 +64,72 @@ GREMIO_POLL_INTERVAL = 3600.0
 API_TIMEOUT = 15.0
 AUDIO_INPUT_DEVICE = os.getenv("AUDIO_INPUT_DEVICE", "").strip()
 
-# Audio VU tuning - continuous mic-level meter (speech, not music transients).
-# Auto Gain Control on the USB mic was normalizing quiet/loud audio to nearly
-# the same level, killing the dynamic range a VU meter needs - disable it at
-# the ALSA level (amixer -c <card> sset 'Auto Gain Control' off; persist with
-# alsactl store) before this will read sensibly.
-#
-# Level is normalized against a self-adjusting noise floor (an auto-ranging
-# noise gate, not a fixed reference level) so it re-calibrates to whatever
-# room/mic gain it's running in instead of needing a hand-measured constant:
-#   - floor tracks the recent quiet-est level: snaps down fast, creeps up slow.
-#   - ceiling is derived from the floor by a fixed ratio, not tracked
-#     independently - two separately-adaptive envelopes chase each other with
-#     nothing to anchor the ceiling during quiet stretches (measured this
-#     going unstable: ambient alone dragged the ceiling down until ordinary
-#     room noise read as "loud"). A floor-relative gate is the standard,
-#     boring, stable version of this (same idea real noise gates use).
-#   - displayed level = (raw - floor) / (floor*ratio - floor), clamped 0..1.
-# Measured on this Pi's mic with AGC off: silence ~0.006-0.011 RMS, a normal
-# speech burst ~0.066 RMS - ratio of ~8-9x sets AUDIO_VU_CEILING_RATIO below.
-AUDIO_VU_FLOOR_SEED = 0.008
-AUDIO_VU_FLOOR_TAU_DOWN = 1.2   # seconds to mostly settle onto a new, quieter floor
-AUDIO_VU_FLOOR_TAU_UP = 8.0     # seconds to drift the floor up if the room gets noisier
-AUDIO_VU_CEILING_RATIO = 9.0    # "loud" = floor * this
-AUDIO_VU_MIN_RANGE = 0.05       # floor..ceiling floor - guards near-zero floor
+# Party mode - beat-synced light show driven by the USB mic.
+# Pipeline (all numpy, runs in the audio thread only while Party is active):
+#   1. Onset envelope: spectral flux (sum of positive frame-to-frame rises in
+#      log-magnitude) per 1024-sample block, in two bands. The bass band
+#      (kick drum) carries the beat; the mid band helps on kick-less music.
+#   2. Tempo: autocorrelation of the last few seconds of that envelope,
+#      weighted toward ~120 BPM so it prefers the beat over 8th notes / half
+#      time (same idea as librosa's tempo estimator, done incrementally).
+#   3. Phase: comb-filter the envelope at the found period to locate where
+#      the beats land, then predict the next ones so the relays switch *on*
+#      the beat instead of a block late.
+#   4. Energy: short vs long loudness average -> breakdowns and drops.
+# The relays click when they switch and the mic hears it. The click is
+# mostly above ~1 kHz, so while it rings only the mid band is masked - the
+# bass band keeps running, otherwise every beat we switch on would be erased
+# from the envelope and the tracker would lose its own lock.
+PARTY_TEMPO_WINDOW_SECONDS = 8.0   # onset history used for tempo/phase
+PARTY_MIN_HISTORY_SECONDS = 3.0    # before this, no tempo guess at all
+PARTY_TEMPO_UPDATE_SECONDS = 0.5
+PARTY_MIN_BPM = 60.0
+PARTY_MAX_BPM = 180.0
+PARTY_PRIOR_BPM = 120.0            # centre of the tempo preference
+PARTY_PRIOR_OCTAVES = 1.0          # width of that preference (log2 std dev)
+PARTY_LOCK_CONFIDENCE = 0.20       # normalized autocorrelation needed to lock
+PARTY_UNLOCK_UPDATES = 4           # this many weak estimates in a row -> unlock
+PARTY_TEMPO_CHANGE_UPDATES = 3     # a new tempo must persist this long to win
+PARTY_BASS_BAND = (40.0, 200.0)
+PARTY_MID_BAND = (200.0, 5000.0)
+PARTY_MID_WEIGHT = 0.5
+PARTY_CLICK_MASK_SECONDS = 0.20    # relay click rings ~120-200ms (measured)
+PARTY_SILENCE_RMS = 0.02           # mic RMS below this = no music (mic gain 11/16: quiet room ~-45 dB, music ~-20 dB)
+PARTY_DROP_RISE_DB = 10.0          # jump over the 4 s minimum that counts as a drop (a ballad swings ~7-9 dB)
+PARTY_DROP_COOLDOWN_SECONDS = 10.0
+PARTY_DROP_MIN_LOCK_SECONDS = 8.0  # beat must be held this long before a drop counts
+PARTY_BREAKDOWN_DB = 5.0           # this far under the long average = breakdown
+PARTY_CHILL_MAX_BPM = 95.0
+PARTY_GROOVE_MAX_BPM = 125.0
+PARTY_BEAT_LEAD_SECONDS = 0.03     # fire this early to cover relay + perception lag
+PARTY_MIN_SWITCH_SECONDS = 0.33    # never switch the relays faster than this
+# Music with no beat to lock onto (dense metal through a bass-heavy mic, rubato,
+# ambient): react to individual hits instead. A hit is a block whose spectral
+# flux stands PARTY_HIT_Z standard deviations above that band's last ~2 s.
+PARTY_HIT_Z = 2.5
+PARTY_HIT_STRONG_Z = 4.5           # strong hits light everything
+PARTY_HIT_TAU_SECONDS = 2.0        # how fast the per-band baseline adapts
+PARTY_IDLE_DRIFT_SECONDS = 3.0     # no hits for this long: drift one step so it never freezes
+PARTY_LOG_INTERVAL = 5.0           # tracker summary in the journal, for calibration
+# /?action=party_record saves the last N seconds the tracker heard (relay
+# clicks and all) to PARTY_RECORD_DIR, so live behaviour can be replayed offline.
+PARTY_RECORD_SECONDS = 30.0
+PARTY_RECORD_DIR = os.path.expanduser("~/party-cal")
 
-# Hysteresis bands on the normalized 0..1 scale: separate enter/exit thresholds
-# per color so hovering near a boundary can't flap the relay back and forth
-# (a Schmitt trigger, same trick used in real VU meters and noise gates).
-AUDIO_VU_ENTER_GREEN = 0.16
-AUDIO_VU_EXIT_GREEN = 0.08
-AUDIO_VU_ENTER_YELLOW = 0.50
-AUDIO_VU_EXIT_YELLOW = 0.36
-AUDIO_VU_ENTER_ALL = 0.82
-AUDIO_VU_EXIT_ALL = 0.66
-
-AUDIO_VU_STALE_SECONDS = 0.12
-AUDIO_VU_MODE_LOOP_SECONDS = 0.02
-AUDIO_VU_SMOOTHING_ATTACK = 0.30
-AUDIO_VU_SMOOTHING_RELEASE = 0.82
-# Relay click decays to baseline within ~120-200ms (measured); mute the level
-# tracker for longer than that so the click's own noise never reaches it.
-AUDIO_VU_RELAY_IGNORE_SECONDS = 0.30
-AUDIO_VU_MIN_STEP_SECONDS = 0.09
+# Clock mode - quarter chimes like an old striking clock, as sweeps along the
+# light (green bottom, red top). Lamps stay on as the sweep adds the next one,
+# then all go dark together: up = green, +yellow, +red; down = red, +yellow,
+# +green.
+# :15 = up, :30 = up+down, :45 = up+down+up,
+# :00 = up+down+up+down, then one yellow blink per hour (12h).
+# Between chimes the lamps stay off, like a clock that's silent until it
+# strikes (and it saves power).
+CLOCK_BEAT = 0.75                  # time before the next lamp joins in a sweep
+CLOCK_SWEEP_GAP = 0.75             # dark pause between sweeps
+CLOCK_HOUR_GAP = 1.5               # pause between the last sweep and the first strike
+CLOCK_STRIKE_ON = 0.75             # how long each hour strike stays lit
+CLOCK_STRIKE_INTERVAL = 1.5        # strike to strike
+CLOCK_QUIET_HOURS = (23, 7)        # no chimes from 23:00 to 06:59 (relays click)
 
 # Location / routes
 WEATHER_LAT = "48.137"
@@ -171,7 +194,7 @@ class SharedState:
     traffic_status: Dict = field(default_factory=dict)
     environment_status: Dict = field(default_factory=dict)
     gremio_status: Dict = field(default_factory=dict)
-    audio_vu_level: float = 0.0
+    party_status: Dict = field(default_factory=dict)
     network_connected: bool = False
     mode_state: Dict = field(default_factory=lambda: {
         'next_auto_state': 'green',
@@ -188,11 +211,7 @@ class SharedState:
             {'state': 'all_on', 'duration': 0.2}, {'state': 'off', 'duration': 0.2},
             {'state': 'all_on', 'duration': 0.2}, {'state': 'off', 'duration': 1.5},
         ],
-        'audio_vu_last': 0.0,
-        'audio_vu_ignore_until': 0.0,
-        'audio_vu_last_step_time': 0.0,
-        'audio_vu_floor': AUDIO_VU_FLOOR_SEED,
-        'audio_vu_last_update': 0.0,
+        'click_until': 0.0,
     })
     lock: threading.RLock = field(default_factory=threading.RLock)
     running: bool = True
@@ -210,7 +229,7 @@ class SharedState:
             'traffic': self.traffic_status.copy(),
             'environment': self.environment_status.copy(),
             'gremio': self.gremio_status.copy(),
-            'audio_level': self.audio_vu_level,
+            'party': self.party_status.copy(),
             'network_connected': self.network_connected,
         }
 
@@ -283,9 +302,6 @@ def handle_auto_mode(controller, elapsed: float) -> Optional[float]:
         controller.set_light_state('red_and_yellow'); s.mode_state['next_auto_state'] = 'green'; s.last_state_change_time = time()
     elif c == 'red_and_yellow' and elapsed > AUTO_RED_YELLOW_DURATION:
         controller.set_light_state(s.mode_state['next_auto_state']); s.last_state_change_time = time()
-
-def handle_party_mode(controller, elapsed: float) -> Optional[float]:
-    controller.set_light_state(random.choice(['red','yellow','green','off'])); return PARTY_BLINK_INTERVAL
 
 def handle_emergency_mode(controller, elapsed: float) -> Optional[float]:
     controller.set_light_state('yellow' if controller.state.current_color != 'yellow' else 'off'); return EMERGENCY_BLINK_INTERVAL
@@ -369,47 +385,108 @@ def handle_gremio_mode(controller, elapsed: float) -> Optional[float]:
         return 0.5
     return None
 
-def handle_audio_vu_mode(controller, elapsed: float) -> Optional[float]:
-    state = controller.state
-    now = time()
+# Per vibe: (switch every N beats, light sequence to step through).
+PARTY_PATTERNS: Dict[str, Tuple[int, List[str]]] = {
+    'chill': (4, ['green', 'yellow', 'red', 'yellow']),            # slow pendulum, once a bar
+    'groove': (2, ['red', 'yellow', 'green', 'yellow']),           # chase every other beat
+    'hype': (1, ['red', 'green', 'yellow', 'all_on', 'green', 'red_and_yellow', 'yellow', 'green-yellow']),
+    'drop': (1, ['all_on', 'off']),                                # strobe on the beat
+}
 
-    ignore_until = float(state.mode_state.get('audio_vu_ignore_until', 0.0) or 0.0)
-    if now < ignore_until:
-        return AUDIO_VU_MODE_LOOP_SECONDS
+PARTY_HIT_CHASE = ['red', 'yellow', 'green', 'red_and_yellow', 'green-yellow']
 
-    last = state.mode_state.get('audio_vu_last', 0.0)
-    level = state.audio_vu_level if (now - last) <= AUDIO_VU_STALE_SECONDS else 0.0
+def handle_party_mode(controller, elapsed: float) -> Optional[float]:
+    s = controller.state; ms = s.mode_state; now = time()
+    with s.lock:
+        p = dict(s.party_status)
+    bpm = p.get('bpm'); anchor = p.get('beat_anchor'); vibe = p.get('vibe', 'silence')
 
-    # Hysteresis (a Schmitt trigger): separate enter/exit thresholds per band,
-    # keyed off the color we're currently sitting in, so a level hovering near
-    # a boundary can't flap the relay back and forth every cycle.
-    color = state.current_color
-    if color == 'off':
-        target_color = 'green' if level >= AUDIO_VU_ENTER_GREEN else 'off'
-    elif color == 'green':
-        if level < AUDIO_VU_EXIT_GREEN:
-            target_color = 'off'
-        elif level >= AUDIO_VU_ENTER_YELLOW:
-            target_color = 'green-yellow'
+    if vibe == 'silence':
+        # Nothing playing: stay dark - flickering would just fill the quiet
+        # room with relay clicks.
+        controller.set_light_state('off')
+        return 0.05
+    if not bpm or anchor is None or vibe == 'ambient':
+        # Music without a beat to lock onto: switch on each hit the tracker
+        # hears. Strong hits light everything, others step through a chase.
+        hit = p.get('hit_seq', 0) != ms.get('party_seen_hit')
+        if hit and p.get('hit_strength', 0.0) >= PARTY_HIT_STRONG_Z:
+            color = 'all_on' if s.current_color != 'all_on' else 'off'
+        elif hit or now - ms.get('party_last_switch', 0.0) >= PARTY_IDLE_DRIFT_SECONDS:
+            ms['party_step'] = ms.get('party_step', 0) + 1
+            color = PARTY_HIT_CHASE[ms['party_step'] % len(PARTY_HIT_CHASE)]
         else:
-            target_color = 'green'
-    elif color == 'green-yellow':
-        if level < AUDIO_VU_EXIT_YELLOW:
-            target_color = 'green'
-        elif level >= AUDIO_VU_ENTER_ALL:
-            target_color = 'all_on'
-        else:
-            target_color = 'green-yellow'
-    else:  # all_on
-        target_color = 'all_on' if level >= AUDIO_VU_EXIT_ALL else 'green-yellow'
+            return 0.01
+        ms['party_seen_hit'] = p.get('hit_seq', 0)
+        controller.set_light_state(color); ms['party_last_switch'] = now
+        return 0.01
 
-    if target_color != state.current_color:
-        last_step = float(state.mode_state.get('audio_vu_last_step_time', 0.0) or 0.0)
-        if (now - last_step) < AUDIO_VU_MIN_STEP_SECONDS:
-            return AUDIO_VU_MODE_LOOP_SECONDS
+    # Fire once per predicted beat, a little early to cover relay latency.
+    period = 60.0 / bpm
+    t = now + PARTY_BEAT_LEAD_SECONDS
+    beat = anchor + round((t - anchor) / period) * period
+    if t < beat or beat <= ms.get('party_last_beat', 0.0) + 0.5 * period:
+        return 0.01
+    ms['party_last_beat'] = beat
+    ms['party_beat_count'] = ms.get('party_beat_count', 0) + 1
 
-    controller.set_light_state(target_color)
-    return AUDIO_VU_MODE_LOOP_SECONDS
+    key = 'drop' if p.get('drop') else vibe
+    every, seq = PARTY_PATTERNS.get(key, PARTY_PATTERNS['groove'])
+    while every * period < PARTY_MIN_SWITCH_SECONDS:
+        every *= 2  # very fast tracks: switch on every other beat instead
+    if ms['party_beat_count'] % every:
+        return 0.01
+    ms['party_step'] = ms.get('party_step', 0) + 1
+    controller.set_light_state(seq[ms['party_step'] % len(seq)]); ms['party_last_switch'] = now
+    return 0.01
+
+def _clock_quiet(hour: int) -> bool:
+    start, end = CLOCK_QUIET_HOURS
+    return (hour >= start or hour < end) if start > end else (start <= hour < end)
+
+def clock_chime_sequence(quarter: int, hour12: int) -> List[Tuple[str, float]]:
+    """Steps for one chime. quarter 1..3 = :15/:30/:45, 4 = full hour (+ hour strikes)."""
+    seq: List[Tuple[str, float]] = [('off', 1.0)]  # a beat of darkness before the chime
+    up = ['green', 'green-yellow', 'all_on']
+    down = ['red', 'red_and_yellow', 'all_on']
+    for i in range(quarter):
+        if i:
+            seq.append(('off', CLOCK_SWEEP_GAP))
+        for color in (up if i % 2 == 0 else down):
+            seq.append((color, CLOCK_BEAT))
+    seq.append(('off', CLOCK_HOUR_GAP if quarter == 4 else 1.0))
+    if quarter == 4:
+        for i in range(hour12):
+            seq.append(('yellow', CLOCK_STRIKE_ON))
+            seq.append(('off', CLOCK_STRIKE_INTERVAL - CLOCK_STRIKE_ON if i + 1 < hour12 else 1.0))
+    return seq
+
+def handle_clock_mode(controller, elapsed: float) -> Optional[float]:
+    ms = controller.state.mode_state; now = time(); dt = datetime.now()
+    seq = ms.get('clock_seq')
+    if seq:
+        if now < ms.get('clock_step_until', 0.0):
+            return 0.02
+        idx = ms.get('clock_idx', -1) + 1
+        if idx < len(seq):
+            color, dur = seq[idx]
+            controller.set_light_state(color)
+            ms['clock_idx'] = idx; ms['clock_step_until'] = now + dur
+            return 0.02
+        ms['clock_seq'] = None
+
+    q = dt.minute // 15
+    key = (dt.date().isoformat(), dt.hour, q)
+    if ms.get('clock_last_key') != key:
+        # Entering the mode (key is None) always chimes - that's how you ask the time.
+        entering = ms.get('clock_last_key') is None
+        ms['clock_last_key'] = key
+        if entering or not _clock_quiet(dt.hour):
+            ms['clock_seq'] = clock_chime_sequence(q or 4, dt.hour % 12 or 12)
+            ms['clock_idx'] = -1; ms['clock_step_until'] = 0.0
+            return 0.02
+    controller.set_light_state('off')
+    return 0.2
 
 # --------------------------- Monitors --------------------------------------
 def _get_interface_ipv4(ifname: str) -> Optional[str]:
@@ -908,12 +985,254 @@ def gremio_monitor(controller):
             controller.state.gremio_status = status
         sleep(GREMIO_POLL_INTERVAL)
 
-def audio_vu_monitor(controller):
+class BeatTracker:
+    """Live tempo/phase/energy estimate from mic blocks (see PARTY_* config)."""
+
+    def __init__(self, np, samplerate: int, blocksize: int):
+        self.np = np; self.sr = samplerate; self.bs = blocksize
+        self.fps = samplerate / blocksize  # onset envelope frames per second
+        self.window = np.hanning(2 * blocksize)
+        freqs = np.fft.rfftfreq(2 * blocksize, 1.0 / samplerate)
+        self.bass = (freqs >= PARTY_BASS_BAND[0]) & (freqs <= PARTY_BASS_BAND[1])
+        self.mid = (freqs > PARTY_MID_BAND[0]) & (freqs <= PARTY_MID_BAND[1])
+        self.lag_min = max(1, int(self.fps * 60.0 / PARTY_MAX_BPM))
+        self.lag_max = int(math.ceil(self.fps * 60.0 / PARTY_MIN_BPM))
+        lags = np.arange(self.lag_max + 2, dtype=float); lags[0] = 1.0
+        # Log-normal tempo preference: halves/doubles of the beat get less weight.
+        self.prior = np.exp(-0.5 * (np.log2((60.0 * self.fps / lags) / PARTY_PRIOR_BPM) / PARTY_PRIOR_OCTAVES) ** 2)
+        self.maxlen = int(PARTY_TEMPO_WINDOW_SECONDS * self.fps)
+        self.reset()
+
+    def reset(self) -> None:
+        np = self.np
+        self.prev_block = np.zeros(self.bs, dtype=np.float32)
+        self.prev_bass = None; self.prev_mid = None
+        self.mid_avg = 0.0
+        self.env: deque = deque(maxlen=self.maxlen); self.env_t: deque = deque(maxlen=self.maxlen)
+        self.bpm: Optional[float] = None; self.confidence = 0.0
+        self.anchor: Optional[float] = None
+        self.pending_bpm: Optional[float] = None; self.pending_count = 0
+        self.weak_count = 0
+        self.last_tempo_update = 0.0
+        self.short_db: Optional[float] = None; self.long_db: Optional[float] = None
+        self.recent_db: deque = deque()
+        self.drop_until = 0.0; self.last_drop = 0.0; self.locked_since = 0.0; self.now = 0.0
+        self.band_mean = [0.0, 0.0]; self.band_var = [0.0, 0.0]; self.band_n = [0, 0]
+        self.last_hit = 0.0; self.hit_seq = 0; self.hit_strength = 0.0
+
+    def _band_z(self, i: int, x: float) -> float:
+        # Score against the baseline *before* this block, then fold it in.
+        mean, var = self.band_mean[i], self.band_var[i]
+        z = (x - mean) / math.sqrt(var) if self.band_n[i] >= self.fps and var > 1e-12 else 0.0
+        a = 1.0 - math.exp(-1.0 / (PARTY_HIT_TAU_SECONDS * self.fps))
+        d = x - mean
+        self.band_mean[i] = mean + a * d
+        self.band_var[i] = (1.0 - a) * (var + a * d * d)
+        self.band_n[i] += 1
+        return z
+
+    def process(self, samples, now: float, mask_mid: bool) -> None:
+        np = self.np
+        frame = np.concatenate((self.prev_block, samples)) * self.window
+        self.prev_block = samples.copy()
+        mag = np.log1p(1000.0 * np.abs(np.fft.rfft(frame)))
+        bass = mag[self.bass]; mid = mag[self.mid]
+        bass_flux = float(np.mean(np.maximum(0.0, bass - self.prev_bass))) if self.prev_bass is not None else 0.0
+        hit_z = self._band_z(0, bass_flux)
+        if mask_mid or self.prev_mid is None:
+            mid_flux = self.mid_avg  # relay click is ringing: hold the mid band at its average
+        else:
+            mid_flux = float(np.mean(np.maximum(0.0, mid - self.prev_mid)))
+            self.mid_avg += (mid_flux - self.mid_avg) * 0.05
+            hit_z = max(hit_z, self._band_z(1, mid_flux))
+        # Per-band z-score so whichever band carries the attacks (bass for a
+        # ballad, mids for guitars/snare) can trigger, whatever its level.
+        if hit_z >= PARTY_HIT_Z and now - self.last_hit >= PARTY_MIN_SWITCH_SECONDS:
+            self.last_hit = now; self.hit_seq += 1; self.hit_strength = hit_z
+        self.prev_bass = bass; self.prev_mid = mid
+        # The block was captured over the last bs/sr seconds; stamp its middle.
+        self.env.append(bass_flux + PARTY_MID_WEIGHT * mid_flux)
+        self.env_t.append(now - 0.5 * self.bs / self.sr)
+
+        if not mask_mid:  # the click would read as loudness too
+            self._update_energy(float(np.sqrt(np.mean(np.square(samples)))), now)
+        self.now = now
+        if now - self.last_tempo_update >= PARTY_TEMPO_UPDATE_SECONDS:
+            self.last_tempo_update = now
+            if not self._music():
+                # In a quiet room the only rhythm left is our own relay
+                # clicks - don't let them become a phantom beat.
+                self.bpm = None; self.anchor = None; self.confidence = 0.0
+                return
+            self._update_tempo()
+            self._update_phase()
+
+    def _update_energy(self, rms: float, now: float) -> None:
+        db = 20.0 * math.log10(rms + 1e-9)
+        dt = self.bs / self.sr
+        if self.short_db is None:
+            self.short_db = self.long_db = db
+        self.short_db += (db - self.short_db) * (1.0 - math.exp(-dt / 0.4))
+        self.long_db += (db - self.long_db) * (1.0 - math.exp(-dt / 15.0))
+        self.recent_db.append((now, self.short_db))
+        while self.recent_db and now - self.recent_db[0][0] > 4.0:
+            self.recent_db.popleft()
+        rise = self.short_db - min(d for _, d in self.recent_db)
+        # Only after a settled lock - otherwise the drums coming in after an
+        # intro (or the music starting at all) reads as a drop.
+        if (self.bpm and now - self.locked_since >= PARTY_DROP_MIN_LOCK_SECONDS
+                and rise >= PARTY_DROP_RISE_DB and self.short_db >= self.long_db
+                and now - self.last_drop >= PARTY_DROP_COOLDOWN_SECONDS):
+            self.last_drop = now
+            self.drop_until = now + 8 * 60.0 / self.bpm  # strobe for two bars
+            logging.info(f"Party: drop (+{rise:.1f} dB)")
+
+    def _onset_curve(self):
+        # Subtract a ~0.5 s moving average and keep what sticks out, so the
+        # tempo search sees the hits and not the overall loudness.
+        np = self.np
+        e = np.asarray(self.env, dtype=float)
+        k = max(3, int(self.fps * 0.5)) | 1
+        local = np.convolve(e, np.ones(k) / k, mode='same')
+        return np.maximum(0.0, e - local)
+
+    def _acf_tempo(self) -> Optional[Tuple[float, float]]:
+        """(bpm, confidence) of the strongest beat period in an onset envelope."""
+        np = self.np
+        e = self._onset_curve(); e = e - e.mean()
+        n = len(e); size = 1 << (2 * n - 1).bit_length()
+        spec = np.fft.rfft(e, size)
+        acf = np.fft.irfft(spec * np.conj(spec), size)[:n]
+        if acf[0] <= 1e-12:
+            return None
+        acf = acf / acf[0]
+        hi = min(self.lag_max, n // 2)
+        if hi <= self.lag_min + 1:
+            return None
+        lags = np.arange(self.lag_min, hi + 1)
+        # A true beat period also lines up at twice the lag; 8th notes don't
+        # line up as well at their own double, which helps pick the beat.
+        double = np.where(2 * lags < n, acf[np.minimum(2 * lags, n - 1)], 0.0)
+        score = (acf[lags] + 0.5 * np.maximum(0.0, double)) * self.prior[lags]
+        i = int(np.argmax(score)); lag = float(lags[i]); conf = float(acf[lags[i]])
+        if 0 < i < len(lags) - 1:  # parabolic peak refinement on the raw autocorrelation
+            a, b, c = acf[lags[i] - 1], acf[lags[i]], acf[lags[i] + 1]
+            den = a - 2 * b + c
+            if abs(den) > 1e-12:
+                lag += max(-0.5, min(0.5, float(0.5 * (a - c) / den)))
+        return 60.0 * self.fps / lag, conf  # plain floats: the status dict goes out as JSON
+
+    def _update_tempo(self) -> None:
+        if len(self.env) < PARTY_MIN_HISTORY_SECONDS * self.fps:
+            return
+        found = self._acf_tempo()
+        if found is None:
+            self._weak(); return
+        raw, conf = found
+        self.confidence = conf
+        if conf < PARTY_LOCK_CONFIDENCE:
+            self._weak(); return
+        self.weak_count = 0
+        if self.bpm is None:
+            self.bpm = raw; self.pending_bpm = None; self.locked_since = self.now
+            logging.info(f"Party: locked {raw:.1f} BPM (conf {conf:.2f})")
+            return
+        ratio = raw / self.bpm
+        if abs(ratio - 1.0) <= 0.06:
+            self.bpm += (raw - self.bpm) * 0.2; self.pending_bpm = None
+        elif abs(ratio - 2.0) <= 0.12 or abs(ratio - 0.5) <= 0.03:
+            pass  # octave flip of the same tempo - keep what we have
+        elif self.pending_bpm and abs(raw / self.pending_bpm - 1.0) <= 0.06:
+            self.pending_count += 1
+            if self.pending_count >= PARTY_TEMPO_CHANGE_UPDATES:
+                logging.info(f"Party: tempo change {self.bpm:.1f} -> {raw:.1f} BPM")
+                self.bpm = raw; self.pending_bpm = None; self.anchor = None; self.locked_since = self.now
+        else:
+            self.pending_bpm = raw; self.pending_count = 1
+
+    def _weak(self) -> None:
+        self.weak_count += 1
+        if self.bpm is not None and self.weak_count >= PARTY_UNLOCK_UPDATES:
+            logging.info("Party: lost the beat")
+            self.bpm = None; self.anchor = None
+
+    def _update_phase(self) -> None:
+        if not self.bpm:
+            return
+        np = self.np
+        e = self._onset_curve(); n = len(e)
+        period = self.fps * 60.0 / self.bpm
+        beats = int((n - 1) / period)
+        if beats < 2:
+            return
+        # Comb filter: for each offset back from the newest frame, sum the
+        # envelope at every beat before it (recent beats weigh more).
+        best, best_off = -1.0, 0
+        weights = 0.85 ** np.arange(beats)
+        for off in range(int(math.ceil(period))):
+            idx = (n - 1 - off - np.round(np.arange(beats) * period)).astype(int)
+            idx = idx[idx >= 0]
+            sc = float(np.dot(e[idx], weights[:len(idx)]))
+            if sc > best:
+                best, best_off = sc, off
+        found = self.env_t[n - 1 - best_off]
+        p_sec = 60.0 / self.bpm
+        if self.anchor is None:
+            self.anchor = found; return
+        # Phase-locked loop: nudge toward the new estimate instead of jumping,
+        # so one sloppy estimate doesn't jerk the lights.
+        projected = self.anchor + round((found - self.anchor) / p_sec) * p_sec
+        err = found - projected
+        self.anchor = projected + 0.35 * err
+
+    def _music(self) -> bool:
+        return self.short_db is not None and self.short_db > 20.0 * math.log10(PARTY_SILENCE_RMS)
+
+    def status(self, now: float) -> Dict:
+        silence_db = 20.0 * math.log10(PARTY_SILENCE_RMS)
+        music = self._music()
+        breakdown = (self.short_db is not None and self.long_db is not None
+                     and self.short_db < self.long_db - PARTY_BREAKDOWN_DB)
+        if not music:
+            vibe = 'silence'
+        elif not self.bpm or self.anchor is None:
+            vibe = 'ambient'
+        else:
+            vibe = 'chill' if self.bpm < PARTY_CHILL_MAX_BPM else 'groove' if self.bpm < PARTY_GROOVE_MAX_BPM else 'hype'
+            if breakdown:
+                vibe = {'hype': 'groove', 'groove': 'chill'}.get(vibe, vibe)
+        level = 0.0 if self.short_db is None else max(0.0, min(1.0, (self.short_db - silence_db) / 30.0))
+        return {
+            'bpm': round(self.bpm, 1) if self.bpm else None,
+            'confidence': round(self.confidence, 2),
+            'beat_anchor': self.anchor if self.bpm else None,
+            'vibe': vibe,
+            'drop': bool(self.bpm is not None and now < self.drop_until),
+            'level': round(level, 2),
+            'db': round(self.short_db, 1) if self.short_db is not None else None,
+            'rel_db': round(self.short_db - self.long_db, 1) if self.short_db is not None else None,
+            'hit_seq': self.hit_seq,
+            'hit_strength': round(self.hit_strength, 1),
+        }
+
+def _save_party_recording(np, blocks: List, samplerate: int) -> None:
+    import wave
+    try:
+        os.makedirs(PARTY_RECORD_DIR, exist_ok=True)
+        path = os.path.join(PARTY_RECORD_DIR, datetime.now().strftime("live-%Y%m%d-%H%M%S.wav"))
+        pcm = (np.clip(np.concatenate(blocks), -1.0, 1.0) * 32767).astype('<i2')
+        with wave.open(path, 'wb') as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(samplerate); w.writeframes(pcm.tobytes())
+        logging.info(f"Party: saved {len(pcm) / samplerate:.1f}s to {path}")
+    except Exception as e:
+        logging.error(f"Party: recording failed: {e}")
+
+def audio_monitor(controller):
     try:
         import sounddevice as sd  # type: ignore
         import numpy as np  # type: ignore
     except Exception:
-        logging.warning("Audio VU disabled: install sounddevice and numpy")
+        logging.warning("Party audio disabled: install sounddevice and numpy")
         return
 
     blocksize = 1024
@@ -922,7 +1241,7 @@ def audio_vu_monitor(controller):
         try:
             devices = sd.query_devices()
         except Exception as e:
-            logging.error(f"Audio VU: failed to query devices: {e}")
+            logging.error(f"Audio: failed to query devices: {e}")
             return None, None
 
         def _is_valid_input(idx: int) -> bool:
@@ -937,14 +1256,14 @@ def audio_vu_monitor(controller):
                 idx = int(configured)
                 if _is_valid_input(idx):
                     return idx, str(devices[idx].get('name', f'device-{idx}'))
-                logging.warning(f"Audio VU: AUDIO_INPUT_DEVICE index {idx} is not a valid input device")
+                logging.warning(f"Audio: AUDIO_INPUT_DEVICE index {idx} is not a valid input device")
             else:
                 wanted = configured.lower()
                 for idx, dev in enumerate(devices):
                     name = str(dev.get('name', ''))
                     if wanted in name.lower() and _is_valid_input(idx):
                         return idx, name
-                logging.warning(f"Audio VU: AUDIO_INPUT_DEVICE '{configured}' not found among input devices")
+                logging.warning(f"Audio: AUDIO_INPUT_DEVICE '{configured}' not found among input devices")
 
         try:
             default_in = sd.default.device[0]
@@ -966,39 +1285,9 @@ def audio_vu_monitor(controller):
 
         return None, None
 
-    def _update_level(level: float) -> None:
-        now = time()
-        with controller.state.lock:
-            # The relay clicks audibly when the light switches - drop samples
-            # taken while that click is still ringing out, or the mic picks up
-            # its own relay and re-triggers another switch in a feedback loop.
-            ignore_until = float(controller.state.mode_state.get('audio_vu_ignore_until', 0.0) or 0.0)
-            if now < ignore_until:
-                return
-
-            ms = controller.state.mode_state
-            floor = float(ms.get('audio_vu_floor', AUDIO_VU_FLOOR_SEED) or AUDIO_VU_FLOOR_SEED)
-            last_update = float(ms.get('audio_vu_last_update', now) or now)
-            dt = max(0.0, min(now - last_update, 0.5))
-            ms['audio_vu_last_update'] = now
-
-            # Asymmetric envelope follower: floor snaps down onto quiet fast
-            # but only creeps up slowly - so it settles on "recent quiet",
-            # not an average that a sustained loud stretch would drag upward.
-            floor_tau = AUDIO_VU_FLOOR_TAU_DOWN if level < floor else AUDIO_VU_FLOOR_TAU_UP
-            floor += (level - floor) * (1.0 - math.exp(-dt / floor_tau))
-            ms['audio_vu_floor'] = floor
-
-            ceiling = max(floor * AUDIO_VU_CEILING_RATIO, floor + AUDIO_VU_MIN_RANGE)
-            target = max(0.0, min((level - floor) / (ceiling - floor), 1.0))
-            prev = controller.state.audio_vu_level
-            smoothing = AUDIO_VU_SMOOTHING_ATTACK if target >= prev else AUDIO_VU_SMOOTHING_RELEASE
-            controller.state.audio_vu_level = max(0.0, (prev * smoothing) + (target * (1.0 - smoothing)))
-            controller.state.mode_state['audio_vu_last'] = now
-
     device_index, device_name = _resolve_input_device()
     if device_index is None:
-        logging.warning("Audio VU disabled: no input-capable audio device found")
+        logging.warning("Party audio disabled: no input-capable audio device found")
         return
 
     def _candidate_sample_rates() -> List[int]:
@@ -1032,8 +1321,11 @@ def audio_vu_monitor(controller):
                     latency='low',
                 ) as stream:
                     opened = True
+                    tracker = BeatTracker(np, samplerate, blocksize)
+                    active = False; last_log = 0.0
+                    recent: deque = deque(maxlen=int(PARTY_RECORD_SECONDS * samplerate / blocksize))
                     logging.info(
-                        f"Audio VU monitor started (device={device_index}: {device_name}, rate={samplerate}Hz)"
+                        f"Audio monitor started (device={device_index}: {device_name}, rate={samplerate}Hz)"
                     )
                     while controller.state.running:
                         data, overflowed = stream.read(blocksize)
@@ -1042,25 +1334,52 @@ def audio_vu_monitor(controller):
                         if data.size == 0:
                             continue
                         samples = data[:, 0] if data.ndim > 1 else data
-                        rms = float(np.sqrt(np.mean(np.square(samples))))
-                        peak = float(np.max(np.abs(samples)))
-                        level = max(rms, peak * 0.35)
-                        _update_level(level)
+                        now = time()
+                        with controller.state.lock:
+                            party = controller.state.current_mode == 'party'
+                            click = now < controller.state.mode_state.get('click_until', 0.0)
+                            if not party and active:
+                                controller.state.party_status = {}
+                        # Only analyse while Party is on; the stream keeps running
+                        # so the mic doesn't need re-opening every time.
+                        if not party:
+                            active = False
+                            continue
+                        if not active:
+                            tracker.reset(); active = True; recent.clear()
+                        recent.append(samples.copy())
+                        if controller.state.mode_state.pop('party_record', False):
+                            _save_party_recording(np, recent, samplerate)
+                        try:
+                            tracker.process(samples, now, mask_mid=click)
+                            status = tracker.status(now)
+                        except Exception as e:
+                            # Keep the stream alive; start the analysis over.
+                            logging.error(f"Party tracker error: {e}")
+                            tracker.reset(); continue
+                        with controller.state.lock:
+                            controller.state.party_status = status
+                        if now - last_log >= PARTY_LOG_INTERVAL:
+                            last_log = now
+                            logging.info(
+                                f"Party: vibe={status['vibe']} bpm={status['bpm']} conf={status['confidence']} "
+                                f"db={status['db']} rel={status['rel_db']}"
+                            )
                     break
             except Exception as e:
                 last_error = e
                 logging.warning(
-                    f"Audio VU: failed opening InputStream at {samplerate}Hz on device {device_index} ({device_name}): {e}"
+                    f"Audio: failed opening InputStream at {samplerate}Hz on device {device_index} ({device_name}): {e}"
                 )
 
         if not opened:
             logging.error(
-                f"Audio VU monitor error: unable to open InputStream on device {device_index} ({device_name}). "
+                f"Audio monitor error: unable to open InputStream on device {device_index} ({device_name}). "
                 f"Tried rates={tried_rates}. Last error: {last_error}"
             )
     finally:
         with controller.state.lock:
-            controller.state.audio_vu_level = 0.0
+            controller.state.party_status = {}
 
 # iRacing UDP
 
@@ -1175,8 +1494,8 @@ _HTML = f"""
     <a href="#" id="mode-space" onclick="event.preventDefault(); handleModeClick('space')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><ellipse cx="12" cy="12" rx="9" ry="3.2" transform="rotate(35 12 12)"/></svg><span>Space</span></a>
     <a href="#" id="mode-party" onclick="event.preventDefault(); handleModeClick('party')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M6 6l2 2M16 16l2 2M6 18l2-2M16 8l2-2"/></svg><span>Party</span></a>
     <a href="#" id="mode-racing" onclick="event.preventDefault(); handleModeClick('racing')"><svg viewBox="0 0 24 24"><path d="M6 3v18"/><path d="M6 4h11l-2 3 2 3H6"/></svg><span>Racing</span></a>
-    <a href="#" id="mode-audio_vu" onclick="event.preventDefault(); handleModeClick('audio_vu')"><svg viewBox="0 0 24 24"><path d="M4 12v2M8 9v8M12 5v16M16 9v8M20 12v2"/></svg><span>Audio VU</span></a>
     <a href="#" id="mode-gremio" onclick="event.preventDefault(); handleModeClick('gremio')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3.5 9 Q12 12.2 20.5 9"/><path d="M3.5 15 Q12 11.8 20.5 15"/></svg><span>Grêmio</span></a>
+    <a href="#" id="mode-clock" onclick="event.preventDefault(); handleModeClick('clock')"><svg viewBox="0 0 24 24"><path d="M6 16V11a6 6 0 0 1 12 0v5l1.5 2h-15z"/><path d="M10 20.5a2 2 0 0 0 4 0"/><path d="M12 3v2"/></svg><span>Clock</span></a>
     </div>
     </div>
     <script>
@@ -1193,7 +1512,7 @@ _HTML = f"""
             if (color === 'green') return '#00ff00';
             return null;
         }}
-        function computeBarPct(mode, s_bahn_minutes, space_weather, traffic, audio_level, environment, iracing_rev_pct) {{
+        function computeBarPct(mode, s_bahn_minutes, space_weather, traffic, party, environment, iracing_rev_pct) {{
             if (mode === 'racing') {{
                 if (iracing_rev_pct === undefined || iracing_rev_pct === null) return null;
                 return Math.max(0, Math.min(1, iracing_rev_pct / 100));
@@ -1210,8 +1529,9 @@ _HTML = f"""
                 const v = (traffic || {{}}).avg_delay;
                 return (v === undefined || v === null) ? 1 : Math.max(0, Math.min(1, v / 60));
             }}
-            if (mode === 'audio_vu') {{
-                return Math.max(0, Math.min(1, audio_level || 0));
+            if (mode === 'party') {{
+                const v = (party || {{}}).level;
+                return (typeof v === 'number') ? Math.max(0, Math.min(1, v)) : null;
             }}
             if (mode === 's_bahn') {{
                 if (s_bahn_minutes === -1) return 1;
@@ -1219,9 +1539,9 @@ _HTML = f"""
             }}
             return null;
         }}
-        function updateBar(color, mode, s_bahn_minutes, space_weather, traffic, audio_level, environment, iracing_rev_pct) {{
+        function updateBar(color, mode, s_bahn_minutes, space_weather, traffic, party, environment, iracing_rev_pct) {{
             const ledStrip = document.getElementById('ledStrip');
-            const pct = computeBarPct(mode, s_bahn_minutes, space_weather, traffic, audio_level, environment, iracing_rev_pct);
+            const pct = computeBarPct(mode, s_bahn_minutes, space_weather, traffic, party, environment, iracing_rev_pct);
             if (pct === null) {{
                 ledStrip.classList.remove('visible');
                 return;
@@ -1229,7 +1549,7 @@ _HTML = f"""
             ledStrip.classList.add('visible');
             // In racing mode the bar tracks rev_pct continuously even while the main
             // lights are still black (below the first shift point) - fall back to green.
-            const hex = barHexForColor(color) || (mode === 'racing' ? '#00ff00' : null);
+            const hex = barHexForColor(color) || (mode === 'racing' || mode === 'party' ? '#00ff00' : null);
             const raw = hex ? pct * LED_SEGMENTS.length : 0;
             const fullLit = Math.floor(raw);
             const frac = raw - fullLit;
@@ -1241,8 +1561,8 @@ _HTML = f"""
                 seg.style.opacity = lit ? (0.35 + 0.65 * level) : 1;
             }});
         }}
-        function updateVisuals(color, mode, s_bahn_minutes, weather, race_step, space_weather, traffic, audio_level, s_bahn_transit, environment, gremio, iracing_rev_pct) {{
-            updateBar(color, mode, s_bahn_minutes, space_weather, traffic, audio_level, environment, iracing_rev_pct);
+        function updateVisuals(color, mode, s_bahn_minutes, weather, race_step, space_weather, traffic, party, s_bahn_transit, environment, gremio, iracing_rev_pct) {{
+            updateBar(color, mode, s_bahn_minutes, space_weather, traffic, party, environment, iracing_rev_pct);
             if (currentModeFromServer !== mode) {{
                 const currentActive = document.querySelector('.mode-buttons a.active');
                 if (currentActive) currentActive.classList.remove('active');
@@ -1279,13 +1599,12 @@ _HTML = f"""
                 if (traffic && traffic.commute_time) {{ infoDisplay.textContent = `By car: ${{traffic.commute_time}}`; }}
                 else {{ infoDisplay.textContent = 'No traffic data.'; }}
             }}
-            else if (mode === 'audio_vu') {{
-                if (typeof audio_level === 'number') {{
-                    const pct = Math.round(Math.min(Math.max(audio_level, 0), 1) * 100);
-                    infoDisplay.textContent = `Audio level: ${{pct}}%`;
-                }} else {{
-                    infoDisplay.textContent = 'No audio data.';
-                }}
+            else if (mode === 'party') {{
+                const p = party || {{}};
+                const labels = {{silence: 'Waiting for music…', ambient: 'Listening for a beat…', chill: 'Chill', groove: 'Groove', hype: 'Hype'}};
+                let txt = labels[p.vibe] || 'Starting…';
+                if (p.bpm) txt = `${{Math.round(p.bpm)}} BPM · ${{p.drop ? 'DROP!' : txt}} · lock ${{Math.round((p.confidence || 0) * 100)}}%`;
+                infoDisplay.textContent = txt;
             }}
             else if (mode === 'uv') {{
                 const e = environment || {{}};
@@ -1314,6 +1633,16 @@ _HTML = f"""
                     parts.push(e.is_day ? 'Day' : 'Night');
                 }}
                 infoDisplay.textContent = parts.join(' · ');
+            }}
+            else if (mode === 'clock') {{
+                const d = new Date();
+                const q = Math.floor(d.getMinutes() / 15);
+                const next = new Date(d); next.setMinutes((q + 1) * 15, 0, 0);
+                const hh = next.getHours().toString().padStart(2, '0'), mm = next.getMinutes().toString().padStart(2, '0');
+                const h12 = next.getHours() % 12 || 12;
+                const n = next.getMinutes() === 0 ? `4 sweeps + ${{h12}} blink${{h12 === 1 ? '' : 's'}}` : `${{next.getMinutes() / 15}} sweep${{next.getMinutes() === 15 ? '' : 's'}}`;
+                const quiet = next.getHours() >= 23 || next.getHours() < 7;
+                infoDisplay.textContent = `Next: ${{hh}}:${{mm}} · ${{quiet ? 'quiet hours' : n}}`;
             }}
             else if (mode === 'gremio') {{
                 const g = gremio || {{}};
@@ -1382,7 +1711,6 @@ _HTML = f"""
             }}
         }}
         function stopLocalAnimation() {{ if (localAnimationId) {{ clearInterval(localAnimationId); clearTimeout(localAnimationId); localAnimationId = null; }} }}
-        function startPartyAnimation() {{ stopLocalAnimation(); localAnimationId = setInterval(() => {{ const colors = ['red', 'yellow', 'green', 'off']; updateVisuals(colors[Math.floor(Math.random() * colors.length)], 'party', -1, {{}}, 0, {{}}, {{}}, 0, {{}}, {{}}, {{}}); }}, 80); }}
         function startSosAnimation() {{
             stopLocalAnimation();
             const sosPattern = [
@@ -1407,7 +1735,7 @@ _HTML = f"""
             lastModeClickTime = now;
             const isTogglingOff = currentModeFromServer === mode;
             stopLocalAnimation(); fetch(`/?action=set_mode&mode=${{mode}}`);
-            if (!isTogglingOff) {{ if (mode === 'party') startPartyAnimation(); else if (mode === 'sos') startSosAnimation(); }}
+            if (!isTogglingOff && mode === 'sos') startSosAnimation();
         }}
         function setConnected(ok) {{
             const pill = document.getElementById('connPill');
@@ -1417,7 +1745,7 @@ _HTML = f"""
         }}
         function applyStatus(status) {{
             if (localAnimationId) return;
-            updateVisuals(status.color, status.mode, status.s_bahn_minutes, status.weather, status.race_step, status.space_weather, status.traffic, status.audio_level, status.s_bahn_transit, status.environment, status.gremio, status.iracing_rev_pct);
+            updateVisuals(status.color, status.mode, status.s_bahn_minutes, status.weather, status.race_step, status.space_weather, status.traffic, status.party, status.s_bahn_transit, status.environment, status.gremio, status.iracing_rev_pct);
         }}
         let eventSource = null;
         function connectEvents() {{
@@ -1478,6 +1806,8 @@ class _Handler(BaseHTTPRequestHandler):
                 elif act=='set_mode':
                     mode = q.get('mode',[''])[0];
                     if mode: self.controller.set_mode(mode)
+                elif act=='party_record':
+                    with self.controller.state.lock: self.controller.state.mode_state['party_record'] = True
                 self.send_response(200); self.end_headers(); return
             except Exception as e:
                 logging.error(f"action error {act}: {e}"); self._err(400,'bad'); return
@@ -1508,9 +1838,9 @@ class TrafficLightController:
             'racing': handle_racing_mode,
             'space': handle_space_mode,
             'stau': handle_stau_mode,
-            'audio_vu': handle_audio_vu_mode,
             'uv': handle_uv_mode,
             'gremio': handle_gremio_mode,
+            'clock': handle_clock_mode,
         }
     def _init_hardware(self, use_mock_hardware: bool) -> LightHardware:
         if use_mock_hardware:
@@ -1548,10 +1878,8 @@ class TrafficLightController:
             prev = self.state.current_color
             try:
                 self.hardware.set_state(color); self.state.current_color = color
-                if self.state.current_mode == 'audio_vu':
-                    now = time()
-                    self.state.mode_state['audio_vu_last_step_time'] = now
-                    self.state.mode_state['audio_vu_ignore_until'] = now + AUDIO_VU_RELAY_IGNORE_SECONDS
+                # The relay click is audible to the mic; Party masks it out.
+                self.state.mode_state['click_until'] = time() + PARTY_CLICK_MASK_SECONDS
                 logging.info(f"Light: {prev} -> {color}")
             except Exception as e:
                 logging.error(f"Failed to set light {color}: {e}")
@@ -1617,8 +1945,13 @@ class TrafficLightController:
             self.set_light_state(self.state.mode_state['sos_pattern'][0]['state'])
         elif new_mode == 'racing':
             self.state.mode_state['race_step'] = 0; self.set_light_state('off')
-        elif new_mode == 'audio_vu':
-            self.set_light_state('off'); self.state.audio_vu_level = 0.0; self.state.mode_state['audio_vu_last'] = time(); self.state.mode_state['audio_vu_ignore_until'] = time() + AUDIO_VU_RELAY_IGNORE_SECONDS; self.state.mode_state['audio_vu_last_step_time'] = time(); self.state.mode_state['audio_vu_floor'] = AUDIO_VU_FLOOR_SEED; self.state.mode_state['audio_vu_last_update'] = 0.0
+        elif new_mode == 'party':
+            self.state.party_status = {}
+            for k in ('party_last_beat', 'party_last_switch'): self.state.mode_state[k] = 0.0
+            for k in ('party_beat_count', 'party_step'): self.state.mode_state[k] = 0
+        elif new_mode == 'clock':
+            # No last chime yet: the handler chimes the current time right away.
+            self.state.mode_state['clock_seq'] = None; self.state.mode_state['clock_last_key'] = None
         elif new_mode == 'idle':
             self.set_light_state('off')
     def shutdown(self):
@@ -1673,7 +2006,7 @@ def main():
         threading.Thread(target=space_weather_monitor, args=(ctrl,), name='space', daemon=True),
         threading.Thread(target=traffic_monitor, args=(ctrl,), name='traffic', daemon=True),
         threading.Thread(target=iracing_udp_listener, args=(ctrl,), name='iracing', daemon=True),
-        threading.Thread(target=audio_vu_monitor, args=(ctrl,), name='audio_vu', daemon=True),
+        threading.Thread(target=audio_monitor, args=(ctrl,), name='audio', daemon=True),
         threading.Thread(target=network_monitor, args=(ctrl,), name='network', daemon=True),
         threading.Thread(target=transit_monitor, args=(ctrl,), name='transit', daemon=True),
         threading.Thread(target=environment_monitor, args=(ctrl,), name='environment', daemon=True),
