@@ -75,7 +75,8 @@ AUDIO_INPUT_DEVICE = os.getenv("AUDIO_INPUT_DEVICE", "").strip()
 #   3. Phase: comb-filter the envelope at the found period to locate where
 #      the beats land, then predict the next ones so the relays switch *on*
 #      the beat instead of a block late.
-#   4. Energy: short vs long loudness average -> breakdowns and drops.
+#   4. Lights: one random lamp on every predicted beat (a different one
+#      each time), so the light hops in time with the music.
 # The relays click when they switch and the mic hears it. The click is
 # mostly above ~1 kHz, so while it rings only the mid band is masked - the
 # bass band keeps running, otherwise every beat we switch on would be erased
@@ -95,10 +96,6 @@ PARTY_MID_BAND = (200.0, 5000.0)
 PARTY_MID_WEIGHT = 0.5
 PARTY_CLICK_MASK_SECONDS = 0.20    # relay click rings ~120-200ms (measured)
 PARTY_SILENCE_RMS = 0.02           # mic RMS below this = no music (mic gain 11/16: quiet room ~-45 dB, music ~-20 dB)
-PARTY_DROP_RISE_DB = 10.0          # jump over the 4 s minimum that counts as a drop (a ballad swings ~7-9 dB)
-PARTY_DROP_COOLDOWN_SECONDS = 10.0
-PARTY_DROP_MIN_LOCK_SECONDS = 8.0  # beat must be held this long before a drop counts
-PARTY_BREAKDOWN_DB = 5.0           # this far under the long average = breakdown
 PARTY_CHILL_MAX_BPM = 95.0
 PARTY_GROOVE_MAX_BPM = 125.0
 PARTY_BEAT_LEAD_SECONDS = 0.03     # fire this early to cover relay + perception lag
@@ -107,7 +104,6 @@ PARTY_MIN_SWITCH_SECONDS = 0.33    # never switch the relays faster than this
 # ambient): react to individual hits instead. A hit is a block whose spectral
 # flux stands PARTY_HIT_Z standard deviations above that band's last ~2 s.
 PARTY_HIT_Z = 2.5
-PARTY_HIT_STRONG_Z = 4.5           # strong hits light everything
 PARTY_HIT_TAU_SECONDS = 2.0        # how fast the per-band baseline adapts
 PARTY_IDLE_DRIFT_SECONDS = 3.0     # no hits for this long: drift one step so it never freezes
 PARTY_LOG_INTERVAL = 5.0           # tracker summary in the journal, for calibration
@@ -385,15 +381,12 @@ def handle_gremio_mode(controller, elapsed: float) -> Optional[float]:
         return 0.5
     return None
 
-# Per vibe: (switch every N beats, light sequence to step through).
-PARTY_PATTERNS: Dict[str, Tuple[int, List[str]]] = {
-    'chill': (4, ['green', 'yellow', 'red', 'yellow']),            # slow pendulum, once a bar
-    'groove': (2, ['red', 'yellow', 'green', 'yellow']),           # chase every other beat
-    'hype': (1, ['red', 'green', 'yellow', 'all_on', 'green', 'red_and_yellow', 'yellow', 'green-yellow']),
-    'drop': (1, ['all_on', 'off']),                                # strobe on the beat
-}
+PARTY_LAMPS = ('red', 'yellow', 'green')
 
-PARTY_HIT_CHASE = ['red', 'yellow', 'green', 'red_and_yellow', 'green-yellow']
+def _party_hop(controller) -> None:
+    # Light one lamp, never the one already on, so every switch is visible.
+    current = controller.state.current_color
+    controller.set_light_state(random.choice([c for c in PARTY_LAMPS if c != current]))
 
 def handle_party_mode(controller, elapsed: float) -> Optional[float]:
     s = controller.state; ms = s.mode_state; now = time()
@@ -407,18 +400,12 @@ def handle_party_mode(controller, elapsed: float) -> Optional[float]:
         controller.set_light_state('off')
         return 0.05
     if not bpm or anchor is None or vibe == 'ambient':
-        # Music without a beat to lock onto: switch on each hit the tracker
-        # hears. Strong hits light everything, others step through a chase.
+        # Music without a beat to lock onto: hop on each hit the tracker
+        # hears, or drift now and then so it never freezes.
         hit = p.get('hit_seq', 0) != ms.get('party_seen_hit')
-        if hit and p.get('hit_strength', 0.0) >= PARTY_HIT_STRONG_Z:
-            color = 'all_on' if s.current_color != 'all_on' else 'off'
-        elif hit or now - ms.get('party_last_switch', 0.0) >= PARTY_IDLE_DRIFT_SECONDS:
-            ms['party_step'] = ms.get('party_step', 0) + 1
-            color = PARTY_HIT_CHASE[ms['party_step'] % len(PARTY_HIT_CHASE)]
-        else:
-            return 0.01
-        ms['party_seen_hit'] = p.get('hit_seq', 0)
-        controller.set_light_state(color); ms['party_last_switch'] = now
+        if hit or now - ms.get('party_last_switch', 0.0) >= PARTY_IDLE_DRIFT_SECONDS:
+            ms['party_seen_hit'] = p.get('hit_seq', 0)
+            _party_hop(controller); ms['party_last_switch'] = now
         return 0.01
 
     # Fire once per predicted beat, a little early to cover relay latency.
@@ -429,15 +416,11 @@ def handle_party_mode(controller, elapsed: float) -> Optional[float]:
         return 0.01
     ms['party_last_beat'] = beat
     ms['party_beat_count'] = ms.get('party_beat_count', 0) + 1
-
-    key = 'drop' if p.get('drop') else vibe
-    every, seq = PARTY_PATTERNS.get(key, PARTY_PATTERNS['groove'])
+    every = 1
     while every * period < PARTY_MIN_SWITCH_SECONDS:
-        every *= 2  # very fast tracks: switch on every other beat instead
-    if ms['party_beat_count'] % every:
-        return 0.01
-    ms['party_step'] = ms.get('party_step', 0) + 1
-    controller.set_light_state(seq[ms['party_step'] % len(seq)]); ms['party_last_switch'] = now
+        every *= 2  # very fast tracks: hop on every other beat instead
+    if ms['party_beat_count'] % every == 0:
+        _party_hop(controller); ms['party_last_switch'] = now
     return 0.01
 
 def _clock_quiet(hour: int) -> bool:
@@ -1015,8 +998,6 @@ class BeatTracker:
         self.weak_count = 0
         self.last_tempo_update = 0.0
         self.short_db: Optional[float] = None; self.long_db: Optional[float] = None
-        self.recent_db: deque = deque()
-        self.drop_until = 0.0; self.last_drop = 0.0; self.locked_since = 0.0; self.now = 0.0
         self.band_mean = [0.0, 0.0]; self.band_var = [0.0, 0.0]; self.band_n = [0, 0]
         self.last_hit = 0.0; self.hit_seq = 0; self.hit_strength = 0.0
 
@@ -1055,8 +1036,7 @@ class BeatTracker:
         self.env_t.append(now - 0.5 * self.bs / self.sr)
 
         if not mask_mid:  # the click would read as loudness too
-            self._update_energy(float(np.sqrt(np.mean(np.square(samples)))), now)
-        self.now = now
+            self._update_energy(float(np.sqrt(np.mean(np.square(samples)))))
         if now - self.last_tempo_update >= PARTY_TEMPO_UPDATE_SECONDS:
             self.last_tempo_update = now
             if not self._music():
@@ -1067,25 +1047,13 @@ class BeatTracker:
             self._update_tempo()
             self._update_phase()
 
-    def _update_energy(self, rms: float, now: float) -> None:
+    def _update_energy(self, rms: float) -> None:
         db = 20.0 * math.log10(rms + 1e-9)
         dt = self.bs / self.sr
         if self.short_db is None:
             self.short_db = self.long_db = db
         self.short_db += (db - self.short_db) * (1.0 - math.exp(-dt / 0.4))
         self.long_db += (db - self.long_db) * (1.0 - math.exp(-dt / 15.0))
-        self.recent_db.append((now, self.short_db))
-        while self.recent_db and now - self.recent_db[0][0] > 4.0:
-            self.recent_db.popleft()
-        rise = self.short_db - min(d for _, d in self.recent_db)
-        # Only after a settled lock - otherwise the drums coming in after an
-        # intro (or the music starting at all) reads as a drop.
-        if (self.bpm and now - self.locked_since >= PARTY_DROP_MIN_LOCK_SECONDS
-                and rise >= PARTY_DROP_RISE_DB and self.short_db >= self.long_db
-                and now - self.last_drop >= PARTY_DROP_COOLDOWN_SECONDS):
-            self.last_drop = now
-            self.drop_until = now + 8 * 60.0 / self.bpm  # strobe for two bars
-            logging.info(f"Party: drop (+{rise:.1f} dB)")
 
     def _onset_curve(self):
         # Subtract a ~0.5 s moving average and keep what sticks out, so the
@@ -1134,7 +1102,7 @@ class BeatTracker:
             self._weak(); return
         self.weak_count = 0
         if self.bpm is None:
-            self.bpm = raw; self.pending_bpm = None; self.locked_since = self.now
+            self.bpm = raw; self.pending_bpm = None
             logging.info(f"Party: locked {raw:.1f} BPM (conf {conf:.2f})")
             return
         ratio = raw / self.bpm
@@ -1146,7 +1114,7 @@ class BeatTracker:
             self.pending_count += 1
             if self.pending_count >= PARTY_TEMPO_CHANGE_UPDATES:
                 logging.info(f"Party: tempo change {self.bpm:.1f} -> {raw:.1f} BPM")
-                self.bpm = raw; self.pending_bpm = None; self.anchor = None; self.locked_since = self.now
+                self.bpm = raw; self.pending_bpm = None; self.anchor = None
         else:
             self.pending_bpm = raw; self.pending_count = 1
 
@@ -1191,23 +1159,19 @@ class BeatTracker:
     def status(self, now: float) -> Dict:
         silence_db = 20.0 * math.log10(PARTY_SILENCE_RMS)
         music = self._music()
-        breakdown = (self.short_db is not None and self.long_db is not None
-                     and self.short_db < self.long_db - PARTY_BREAKDOWN_DB)
         if not music:
             vibe = 'silence'
         elif not self.bpm or self.anchor is None:
             vibe = 'ambient'
         else:
+            # Label only (shown in the UI) - the lights hop on every beat either way.
             vibe = 'chill' if self.bpm < PARTY_CHILL_MAX_BPM else 'groove' if self.bpm < PARTY_GROOVE_MAX_BPM else 'hype'
-            if breakdown:
-                vibe = {'hype': 'groove', 'groove': 'chill'}.get(vibe, vibe)
         level = 0.0 if self.short_db is None else max(0.0, min(1.0, (self.short_db - silence_db) / 30.0))
         return {
             'bpm': round(self.bpm, 1) if self.bpm else None,
             'confidence': round(self.confidence, 2),
             'beat_anchor': self.anchor if self.bpm else None,
             'vibe': vibe,
-            'drop': bool(self.bpm is not None and now < self.drop_until),
             'level': round(level, 2),
             'db': round(self.short_db, 1) if self.short_db is not None else None,
             'rel_db': round(self.short_db - self.long_db, 1) if self.short_db is not None else None,
@@ -1603,7 +1567,7 @@ _HTML = f"""
                 const p = party || {{}};
                 const labels = {{silence: 'Waiting for music…', ambient: 'Listening for a beat…', chill: 'Chill', groove: 'Groove', hype: 'Hype'}};
                 let txt = labels[p.vibe] || 'Starting…';
-                if (p.bpm) txt = `${{Math.round(p.bpm)}} BPM · ${{p.drop ? 'DROP!' : txt}} · lock ${{Math.round((p.confidence || 0) * 100)}}%`;
+                if (p.bpm) txt = `${{Math.round(p.bpm)}} BPM · ${{txt}} · lock ${{Math.round((p.confidence || 0) * 100)}}%`;
                 infoDisplay.textContent = txt;
             }}
             else if (mode === 'uv') {{
@@ -1948,7 +1912,7 @@ class TrafficLightController:
         elif new_mode == 'party':
             self.state.party_status = {}
             for k in ('party_last_beat', 'party_last_switch'): self.state.mode_state[k] = 0.0
-            for k in ('party_beat_count', 'party_step'): self.state.mode_state[k] = 0
+            self.state.mode_state['party_beat_count'] = 0
         elif new_mode == 'clock':
             # No last chime yet: the handler chimes the current time right away.
             self.state.mode_state['clock_seq'] = None; self.state.mode_state['clock_last_key'] = None
