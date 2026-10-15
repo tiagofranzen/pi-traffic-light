@@ -42,10 +42,10 @@ yellow, or green in the end.
 | Biergarten | Temperature / weather / time of day | OpenWeatherMap key |
 | UV | Current UV index |, |
 | Space | Geomagnetic Kp index (aurora/storm risk) |, |
-| Party | Random color flicker, no logic, no reason |, |
+| Party | Listens to the room and flashes on the beat: slow songs sway once a bar, bangers hit every beat, drops strobe. Stays dark in silence | a USB mic |
 | Racing | Live flags + rev bar from iRacing, via [`simhub-plugin/`](simhub-plugin) | the plugin, UDP → port 9001 |
-| Audio VU | Mic level | a USB mic |
 | Grêmio | Last match result |, (ESPN) |
+| Clock | Chimes like an old striking clock: lamps filling up (green, +yellow, +red) or down (red, +yellow, +green), then all off - 1/2/3/4 sweeps (up, up-down, up-down-up, up-down-up-down) at :15/:30/:45/:00, then one yellow blink per hour. Dark between chimes. Quiet 23:00-07:00 |, |
 
 No API key, no drama, those modes just sit there looking pretty instead
 of doing anything useful.
