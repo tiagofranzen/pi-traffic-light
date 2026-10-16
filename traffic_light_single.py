@@ -1735,8 +1735,28 @@ _HTML = f"""
             document.getElementById('rule').innerHTML = SUBS[mode].rule.map(([c, txt]) =>
                 `<span><b style="background:${{c === 'a' ? 'linear-gradient(#ff2b2b,#ffcb2e,#2bd672)' : dot[c]}}"></b>${{txt}}</span>`).join('');
         }}
+        const pad2 = n => n.toString().padStart(2, '0');
+        function clockNextChime() {{
+            const d = new Date();
+            const next = new Date(d); next.setMinutes((Math.floor(d.getMinutes() / 15) + 1) * 15, 0, 0);
+            const h12 = next.getHours() % 12 || 12;
+            const n = next.getMinutes() === 0 ? `4 sweeps + ${{h12}} blink${{h12 === 1 ? '' : 's'}}` : `${{next.getMinutes() / 15}} sweep${{next.getMinutes() === 15 ? '' : 's'}}`;
+            const quiet = next.getHours() >= {CLOCK_QUIET_HOURS[0]} || next.getHours() < {CLOCK_QUIET_HOURS[1]};
+            return `Next: ${{pad2(next.getHours())}}:${{pad2(next.getMinutes())}} · ${{quiet ? 'quiet hours' : n}}`;
+        }}
+        function clockTitle() {{
+            const d = new Date();
+            return `CLOCK <em>· ${{pad2(d.getHours())}}:${{pad2(d.getMinutes())}}:${{pad2(d.getSeconds())}}</em>`;
+        }}
+        // The Pi only pushes status when something changes, so the clock ticks on its own.
+        setInterval(() => {{
+            if (currentModeFromServer !== 'clock') return;
+            document.querySelector('#modeText strong').innerHTML = clockTitle();
+            document.getElementById('info-display').textContent = clockNextChime();
+        }}, 1000);
         function modeTitle(mode) {{
             if (mode === 'idle') return 'OFF';
+            if (mode === 'clock') return clockTitle();
             const g = GROUP_OF[mode];
             if (!g) return mode.replace('_', ' ').toUpperCase();
             const name = GROUPS[g].name.toUpperCase();
@@ -1915,14 +1935,7 @@ _HTML = f"""
                 else infoDisplay.textContent = `Dry for the next {RAIN_YELLOW_MINUTES // 60} h (max ${{e.rain_prob_max || 0}}%).`;
             }}
             else if (mode === 'clock') {{
-                const d = new Date();
-                const q = Math.floor(d.getMinutes() / 15);
-                const next = new Date(d); next.setMinutes((q + 1) * 15, 0, 0);
-                const hh = next.getHours().toString().padStart(2, '0'), mm = next.getMinutes().toString().padStart(2, '0');
-                const h12 = next.getHours() % 12 || 12;
-                const n = next.getMinutes() === 0 ? `4 sweeps + ${{h12}} blink${{h12 === 1 ? '' : 's'}}` : `${{next.getMinutes() / 15}} sweep${{next.getMinutes() === 15 ? '' : 's'}}`;
-                const quiet = next.getHours() >= 23 || next.getHours() < 7;
-                infoDisplay.textContent = `Next: ${{hh}}:${{mm}} · ${{quiet ? 'quiet hours' : n}}`;
+                infoDisplay.textContent = clockNextChime();
             }}
             else if (mode === 'gremio') {{
                 const g = gremio || {{}};
