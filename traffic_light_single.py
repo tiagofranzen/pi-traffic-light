@@ -53,10 +53,11 @@ AUTO_RED_YELLOW_DURATION = 2.0
 EMERGENCY_BLINK_INTERVAL = 0.5
 CONTROLLER_LOOP_SLEEP = 0.2
 # Intro played when a Racing sub-mode is selected: (lamps, seconds) steps.
-_REV_SWEEP = ['green', 'green-yellow', 'all_on', 'green-yellow', 'green', 'off']
+# One rev to the limiter: quick climb, hold on redline, drop back, short breath.
+_REV_BLIP = [('green', 0.1), ('green-yellow', 0.1), ('all_on', 0.6), ('green-yellow', 0.12), ('green', 0.12), ('off', 0.35)]
 RACING_INTROS = {
     'race_start': [('off', 1.0), ('red', 1.0), ('red_and_yellow', 1.0), ('all_on', 1.0), ('off', 0.5)],  # start lights
-    'racing': [(c, 0.15) for c in _REV_SWEEP * 2],                                                       # two quick revs
+    'racing': _REV_BLIP * 2,                                                                            # two revs to the limiter
     'hotlap': [('green', 0.4), ('yellow', 0.4), ('green', 0.4), ('yellow', 0.4), ('red', 0.8), ('off', 0.4)],  # delta battle, then invalid
 }
 # Hotlap (Racing sub-mode): live delta to your best lap from the SimHub plugin.
