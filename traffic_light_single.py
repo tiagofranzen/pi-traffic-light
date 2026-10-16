@@ -1589,7 +1589,7 @@ _HTML = f"""
     .conn-pill.lost{{color:#ffd9a0}}
     .conn-pill.lost .conn-dot{{background:var(--warn);animation:pulse 1s infinite}}
     @keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.3}}}}
-    .glass-card{{background:var(--surface);border:1px solid var(--panel-border);border-radius:18px;padding:24px 20px 20px;display:flex;flex-direction:column;align-items:center;gap:16px}}
+    .glass-card{{background:var(--surface);border:1px solid var(--panel-border);border-radius:18px;padding:18px 18px 14px;display:flex;flex-direction:column;align-items:center;gap:10px}}
     .traffic-light-body{{position:relative;padding:18px 20px;display:flex;flex-direction:column;gap:14px;border-radius:20px;border:1px solid transparent}}
     .light{{position:relative;width:86px;height:86px;border-radius:50%;background:#2a2d33;opacity:.4;transition:all .18s cubic-bezier(.4,0,.2,1);cursor:pointer;touch-action:manipulation;box-shadow:inset 0 2px 10px rgba(0,0,0,.5)}}
     .red-on{{background:#ff2b2b;opacity:1;box-shadow:0 0 16px 2px rgba(255,43,43,.55),inset 0 2px 10px rgba(0,0,0,.4)}}
@@ -1597,8 +1597,8 @@ _HTML = f"""
     .green-on{{background:#2bd672;opacity:1;box-shadow:0 0 16px 2px rgba(43,214,114,.5),inset 0 2px 10px rgba(0,0,0,.4)}}
     .controls{{text-align:center;width:100%}}
     #modeText{{font-size:.72em;font-weight:700;letter-spacing:.12em;color:var(--text-muted);text-transform:uppercase;margin:0}}
-    #modeText strong{{display:block;font-size:1.6em;letter-spacing:0;color:var(--text-color);margin-top:3px}}
-    .info-text{{height:2.7em;line-height:1.35em;font-size:.92em;color:var(--text-muted);margin-top:8px;overflow:hidden}}
+    #modeText strong{{display:block;font-size:1.6em;letter-spacing:0;color:var(--text-color)}}
+    .info-text{{height:2.7em;line-height:1.35em;font-size:.92em;color:var(--text-muted);margin-top:4px;overflow:hidden}}
     .section-label{{font-size:.72em;font-weight:700;letter-spacing:.1em;color:var(--text-muted);text-transform:uppercase;margin:0 4px}}
     .mode-buttons{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;width:100%}}
     .mode-buttons a{{display:flex;flex-direction:column;align-items:center;gap:6px;padding:12px 4px 10px;background:rgba(255,255,255,.045);border:1px solid var(--panel-border);border-radius:16px;color:var(--text-muted);text-decoration:none;touch-action:manipulation;transition:background .15s,transform .08s,color .15s,border-color .15s}}
@@ -1608,12 +1608,15 @@ _HTML = f"""
     .mode-buttons a.active{{background:rgba(255,255,255,.06);border-color:#4a4d55;color:#f1f2f4}}
     .mode-buttons a span.tile-sub{{font-size:.58em;font-weight:500;opacity:.8;min-height:1.15em;margin-top:-3px}}
     #modeText strong em{{font-style:normal;color:var(--text-muted);font-weight:600}}
-    .subs[hidden]{{display:none}}
-    .subs{{width:100%;display:flex;flex-direction:column;gap:8px;padding-top:12px;border-top:1px solid var(--panel-border)}}
-    .chips{{display:flex;flex-wrap:wrap;gap:6px;justify-content:center}}
-    .chip{{font:600 .78em -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:var(--text-muted);background:rgba(255,255,255,.045);border:1px solid var(--panel-border);border-radius:999px;padding:7px 12px;cursor:pointer;touch-action:manipulation}}
+    .subs{{width:100%;height:70px;display:flex;flex-direction:column;gap:8px;padding-top:10px;border-top:1px solid var(--panel-border)}}
+    .subs.empty{{visibility:hidden}}
+    .chips{{display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch;flex:none}}
+    .chips::-webkit-scrollbar{{display:none}}
+    .chips .chip:first-child{{margin-left:auto}}
+    .chips .chip:last-child{{margin-right:auto}}
+    .chip{{flex:none;font:600 .76em -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:var(--text-muted);background:rgba(255,255,255,.045);border:1px solid var(--panel-border);border-radius:999px;padding:6px 10px;cursor:pointer;touch-action:manipulation}}
     .chip.active{{color:var(--text-color);background:rgba(255,255,255,.09);border-color:#4a4d55}}
-    .rule{{display:flex;justify-content:center;gap:4px 12px;flex-wrap:wrap;font-size:.74em;color:var(--text-muted);text-align:left}}
+    .rule{{display:flex;justify-content:center;align-content:flex-start;gap:2px 12px;flex-wrap:wrap;font-size:.72em;line-height:1.35;color:var(--text-muted);height:2.7em;overflow:hidden}}
     .rule span{{display:flex;align-items:center;gap:5px}}
     .rule b{{width:8px;height:8px;border-radius:50%;flex:none}}
     .stage{{position:relative;width:fit-content;margin:0 auto}}
@@ -1632,19 +1635,19 @@ _HTML = f"""
     <div class="topbar"><div class="brand">Traffic Light</div><div class="conn-pill live" id="connPill"><div class="conn-dot"></div><span id="connLabel">Live</span></div></div>
     <div class="glass-card">
     <div class="stage"><div class="gremio-stars" id="gremioStars"><svg viewBox="0 0 24 24" fill="#93754F"><path d="M12 2l2.9 6.6L22 9.3l-5 4.8 1.3 7.1L12 17.8 5.7 21.2 7 14.1 2 9.3l7.1-.7z"/></svg><svg viewBox="0 0 24 24" fill="#ABAAAA"><path d="M12 2l2.9 6.6L22 9.3l-5 4.8 1.3 7.1L12 17.8 5.7 21.2 7 14.1 2 9.3l7.1-.7z"/></svg><svg viewBox="0 0 24 24" fill="#F8C300"><path d="M12 2l2.9 6.6L22 9.3l-5 4.8 1.3 7.1L12 17.8 5.7 21.2 7 14.1 2 9.3l7.1-.7z"/></svg></div><div class="traffic-light-body" id="traffic-light"><div id="red" class="light" onclick="handleLightClick('red')"><svg class="gremio-face" id="gremioFaceRed" viewBox="0 0 40 40"></svg></div><div id="yellow" class="light" onclick="handleLightClick('yellow')"><svg class="gremio-face" id="gremioFaceYellow" viewBox="0 0 40 40"></svg></div><div id="green" class="light" onclick="handleLightClick('green')"><svg class="gremio-face" id="gremioFaceGreen" viewBox="0 0 40 40"></svg></div></div><div class="led-strip" id="ledStrip"></div></div>
-    <div class="controls"><h2 id="modeText">Current Mode: <strong></strong></h2><div id="info-display" class="info-text"></div></div>
-    <div class="subs" id="subs" hidden><div class="chips" id="chips"></div><div class="rule" id="rule"></div></div>
+    <div class="controls"><h2 id="modeText"><strong></strong></h2><div id="info-display" class="info-text"></div></div>
+    <div class="subs empty" id="subs"><div class="chips" id="chips"></div><div class="rule" id="rule"></div></div>
     </div>
     <div class="section-label">Modes</div>
     <div class="mode-buttons">
     <a href="#" id="group-auto" onclick="event.preventDefault(); handleGroupClick('auto')"><svg viewBox="0 0 24 24"><rect x="8" y="2.5" width="8" height="19" rx="3"/><circle cx="12" cy="7" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="12" cy="17" r="1.6"/></svg><span>Traffic light</span><span class="tile-sub" id="groupSub-auto"></span></a>
+    <a href="#" id="group-clock" onclick="event.preventDefault(); handleGroupClick('clock')"><svg viewBox="0 0 24 24"><path d="M6 16V11a6 6 0 0 1 12 0v5l1.5 2h-15z"/><path d="M10 20.5a2 2 0 0 0 4 0"/><path d="M12 3v2"/></svg><span>Clock</span><span class="tile-sub" id="groupSub-clock"></span></a>
     <a href="#" id="group-weather" onclick="event.preventDefault(); handleGroupClick('weather')"><svg viewBox="0 0 24 24"><path d="M7 18h10a4 4 0 0 0 0-8 5.5 5.5 0 0 0-10.6 1.5A3.3 3.3 0 0 0 7 18z"/></svg><span>Weather</span><span class="tile-sub" id="groupSub-weather"></span></a>
     <a href="#" id="group-commute" onclick="event.preventDefault(); handleGroupClick('commute')"><svg viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="14" rx="4"/><path d="M5 14h14M9 18l-2 3M15 18l2 3"/><circle cx="9" cy="10" r="1"/><circle cx="15" cy="10" r="1"/></svg><span>Commute</span><span class="tile-sub" id="groupSub-commute"></span></a>
-    <a href="#" id="group-alerts" onclick="event.preventDefault(); handleGroupClick('alerts')"><svg viewBox="0 0 24 24"><path d="M12 3 2.5 20h19L12 3z"/><path d="M12 9.5v4.5"/><circle cx="12" cy="17" r="1" fill="currentColor" stroke="none"/></svg><span>Alerts</span><span class="tile-sub" id="groupSub-alerts"></span></a>
     <a href="#" id="group-party" onclick="event.preventDefault(); handleGroupClick('party')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M6 6l2 2M16 16l2 2M6 18l2-2M16 8l2-2"/></svg><span>Party</span><span class="tile-sub" id="groupSub-party"></span></a>
     <a href="#" id="group-racing" onclick="event.preventDefault(); handleGroupClick('racing')"><svg viewBox="0 0 24 24"><path d="M6 3v18"/><path d="M6 4h11l-2 3 2 3H6"/></svg><span>Racing</span><span class="tile-sub" id="groupSub-racing"></span></a>
     <a href="#" id="group-gremio" onclick="event.preventDefault(); handleGroupClick('gremio')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3.5 9 Q12 12.2 20.5 9"/><path d="M3.5 15 Q12 11.8 20.5 15"/></svg><span>Grêmio</span><span class="tile-sub" id="groupSub-gremio"></span></a>
-    <a href="#" id="group-clock" onclick="event.preventDefault(); handleGroupClick('clock')"><svg viewBox="0 0 24 24"><path d="M6 16V11a6 6 0 0 1 12 0v5l1.5 2h-15z"/><path d="M10 20.5a2 2 0 0 0 4 0"/><path d="M12 3v2"/></svg><span>Clock</span><span class="tile-sub" id="groupSub-clock"></span></a>
+    <a href="#" id="group-alerts" onclick="event.preventDefault(); handleGroupClick('alerts')"><svg viewBox="0 0 24 24"><path d="M12 3 2.5 20h19L12 3z"/><path d="M12 9.5v4.5"/><circle cx="12" cy="17" r="1" fill="currentColor" stroke="none"/></svg><span>Alerts</span><span class="tile-sub" id="groupSub-alerts"></span></a>
     </div>
     </div>
     <script>
@@ -1652,7 +1655,7 @@ _HTML = f"""
         // Tiles are groups; the Pi only knows the flat modes inside them.
         const GROUPS = {{
             auto: {{name: 'Traffic light', modes: ['auto']}},
-            weather: {{name: 'Weather', modes: ['biergarten', 'uv', 'space', 'temp', 'rain']}},
+            weather: {{name: 'Weather', modes: ['temp', 'rain', 'uv', 'biergarten', 'space']}},
             commute: {{name: 'Commute', modes: ['s_bahn', 'stau']}},
             alerts: {{name: 'Alerts', modes: ['emergency', 'sos']}},
             party: {{name: 'Party', modes: ['party', 'audio_vu']}},
@@ -1662,16 +1665,16 @@ _HTML = f"""
         }};
         // Sub-mode name and colour ranges (r/y/g/a = red/yellow/green/all), from the Pi's own settings.
         const SUBS = {{
-            biergarten: {{name: 'Biergarten', rule: [['g', '18°C+, clear, after 16:00'], ['y', '15–18°C or cloudy'], ['r', 'rain, below 15°C or before 16:00']]}},
+            biergarten: {{name: 'Biergarten', rule: [['g', '18°C+, clear, after 16h'], ['y', '15–18°C or cloudy'], ['r', 'rain, below 15°C, before 16h']]}},
             uv: {{name: 'UV', rule: [['g', 'UV under 3'], ['y', '3–5'], ['r', '6+ (blinks at 8+)']]}},
             space: {{name: 'Space', rule: [['g', 'Kp 3 or less'], ['y', 'Kp 4'], ['r', 'Kp 5+ storm (blinks)']]}},
-            temp: {{name: 'Temperature', rule: [['g', '{TEMP_GREEN_RANGE[0]:g}–{TEMP_GREEN_RANGE[1]:g}°C'], ['y', '{TEMP_YELLOW_RANGE[0]:g}–{TEMP_GREEN_RANGE[0]:g} or {TEMP_GREEN_RANGE[1]:g}–{TEMP_YELLOW_RANGE[1]:g}°C'], ['r', 'below {TEMP_YELLOW_RANGE[0]:g} or above {TEMP_YELLOW_RANGE[1]:g}°C']]}},
+            temp: {{name: 'Temperature', chip: 'Temp', rule: [['g', '{TEMP_GREEN_RANGE[0]:g}–{TEMP_GREEN_RANGE[1]:g}°C'], ['y', '{TEMP_YELLOW_RANGE[0]:g}–{TEMP_GREEN_RANGE[0]:g} or {TEMP_GREEN_RANGE[1]:g}–{TEMP_YELLOW_RANGE[1]:g}°C'], ['r', 'below {TEMP_YELLOW_RANGE[0]:g} or above {TEMP_YELLOW_RANGE[1]:g}°C']]}},
             rain: {{name: 'Rain', rule: [['g', 'dry next {RAIN_YELLOW_MINUTES // 60} h'], ['y', 'rain within {RAIN_YELLOW_MINUTES // 60} h'], ['r', 'raining or within {RAIN_RED_MINUTES} min']]}},
             s_bahn: {{name: 'S-Bahn', rule: [['g', '13+ min'], ['y', '10–12 min (blinks at 9)'], ['r', 'under 9 min']]}},
             stau: {{name: 'Stau', rule: [['g', 'delay under 20%'], ['y', '20–45%'], ['r', '45%+']]}},
             emergency: {{name: 'Blinking', rule: [['y', 'blinks every {EMERGENCY_BLINK_INTERVAL:g} s']]}},
             sos: {{name: 'SOS', rule: [['a', 'Morse SOS on all lamps']]}},
-            party: {{name: 'Music', rule: [['a', 'a random lamp on every beat · dark in silence']]}},
+            party: {{name: 'Music', rule: [['a', 'random lamp on every beat'], ['a', 'dark in silence']]}},
             audio_vu: {{name: 'VU meter', rule: [['g', 'quiet'], ['y', 'loud (green + yellow)'], ['r', 'very loud (all)']]}},
         }};
         const GROUP_OF = {{}};
@@ -1691,10 +1694,11 @@ _HTML = f"""
                 if (d.modes.length > 1) document.getElementById(`groupSub-${{g}}`).textContent = SUBS[lastSub[g] || d.modes[0]].name;
             }});
             const g = GROUP_OF[mode], subs = document.getElementById('subs');
-            if (!g || GROUPS[g].modes.length < 2) {{ subs.hidden = true; return; }}
-            subs.hidden = false;
+            if (!g || GROUPS[g].modes.length < 2) {{ subs.classList.add('empty'); return; }}
+            subs.classList.remove('empty');
             document.getElementById('chips').innerHTML = GROUPS[g].modes.map(m =>
-                `<button type="button" class="chip${{m === mode ? ' active' : ''}}" onclick="selectSub('${{m}}')">${{SUBS[m].name}}</button>`).join('');
+                `<button type="button" class="chip${{m === mode ? ' active' : ''}}" onclick="selectSub('${{m}}')">${{SUBS[m].chip || SUBS[m].name}}</button>`).join('');
+            document.querySelector('#chips .active')?.scrollIntoView({{inline: 'nearest', block: 'nearest'}});
             const dot = {{r: '#ff2b2b', y: '#ffcb2e', g: '#2bd672'}};
             document.getElementById('rule').innerHTML = SUBS[mode].rule.map(([c, txt]) =>
                 `<span><b style="background:${{c === 'a' ? 'linear-gradient(#ff2b2b,#ffcb2e,#2bd672)' : dot[c]}}"></b>${{txt}}</span>`).join('');
