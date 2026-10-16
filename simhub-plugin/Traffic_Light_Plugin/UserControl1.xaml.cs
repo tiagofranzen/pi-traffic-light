@@ -21,7 +21,6 @@ namespace SimHub.Plugins.TrafficLight
             // Bind the UI to the settings object
             UdpIpAddressTextBox.Text = Plugin.Settings.UdpIpAddress;
             UdpPortTextBox.Text = Plugin.Settings.UdpPort.ToString();
-            RevLightsCheckBox.IsChecked = Plugin.Settings.UseRevLights;
 
             // Add event handlers to save settings when they change
             UdpIpAddressTextBox.TextChanged += (sender, args) => { Plugin.Settings.UdpIpAddress = UdpIpAddressTextBox.Text; };
@@ -32,7 +31,6 @@ namespace SimHub.Plugins.TrafficLight
                     Plugin.Settings.UdpPort = port;
                 }
             };
-            RevLightsCheckBox.Click += (sender, args) => { Plugin.Settings.UseRevLights = RevLightsCheckBox.IsChecked ?? false; };
 
             // Add event handlers for the test buttons
             SendRedButton.Click += (sender, e) => Plugin.SendUdpMessage("red");
@@ -47,14 +45,6 @@ namespace SimHub.Plugins.TrafficLight
         public void UpdateStatus(string message)
         {
             StatusTextBlock.Text = message;
-        }
-
-        /// <summary>
-        /// Adds the hotlap line (delta and lap validity) under the current status.
-        /// </summary>
-        public void AppendHotlapStatus(string message)
-        {
-            StatusTextBlock.Text = StatusTextBlock.Text.Split('\n')[0] + "\n" + message;
         }
     }
 }

@@ -1,21 +1,12 @@
 # Traffic Light Plugin for SimHub
 
-A SimHub plugin that sends traffic light signals via UDP for racing simulation games. This plugin can operate in two modes: monitoring race flags or engine rev lights.
+A SimHub plugin that sends rev lights, race start lights / flags and the hotlap delta to the traffic light over UDP. It sends everything all the time; the traffic light's Racing tile picks what to show (Start, Revs or Hotlap), so there is nothing to switch in SimHub.
 
-## Features
+## What it sends
 
-### Dual Mode Operation
-- **Flag Mode**: Monitors race flags (yellow, green, red) from racing games
-- **Rev Light Mode**: Monitors engine RPMs and triggers lights based on shift points
-
-### Game Support
-- **iRacing**: Full support with detailed flag detection and race start sequences
-- **Generic**: Basic flag support for other racing games through SimHub
-
-### Hardware Integration
-- Sends UDP packets to control external LED/light hardware
-- Configurable IP address and port settings
-- Progressive rev light patterns (green → green+yellow → all lights)
+- **Rev lights**: green at the first shift light, green + yellow at the second, all three at redline, plus the RPM as a percentage of redline for the bar.
+- **Race start / flags**: iRacing's standing-start lights (red = set, yellow = ready, green = go), otherwise the yellow or green flag. Other games: yellow and green flags.
+- **Hotlap**: live delta to your best lap, and whether the current lap is invalid.
 
 ## Installation
 
@@ -26,42 +17,24 @@ A SimHub plugin that sends traffic light signals via UDP for racing simulation g
 
 ## Configuration
 
-### UDP Settings
-- **IP Address**: Target device IP (default: 127.0.0.1)
-- **Port**: UDP port number (default: 12345)
+- **IP Address**: the traffic light's Pi (default: 127.0.0.1)
+- **Port**: UDP port, 9001 on the Pi (default: 12345)
 
-### Mode Selection
-- **Flag Mode**: Responds to race flags and start sequences
-- **Rev Light Mode**: Responds to engine RPM thresholds
-
-### Manual Testing
-Use the built-in test buttons to verify your hardware setup:
-- Send Red
-- Send Yellow  
-- Send Green
-- Turn Lights Off
+The settings page shows what is being sent right now (revs, start/flags, delta and lap validity) and has test buttons to send red, yellow, green or off.
 
 ## UDP Protocol
 
-The plugin sends simple UTF-8 text messages, one every tick, in the form `"<state>:<rev_pct>:<delta>:<invalid>"`:
+One UTF-8 text message per SimHub tick:
 
-- `rev_pct`: current RPM as a percentage of redline (0-100, e.g. `42.7`). Sent on every tick, including `0`, so the bar always has a fresh value to display.
+`<rev_state>:<rev_pct>:<delta>:<invalid>:<flag_state>`
+
+- `rev_state`: `black`, `green`, `green-yellow` or `all_on` (shift lights).
+- `rev_pct`: current RPM as a percentage of redline (0-100, e.g. `42.7`). Sent every tick, including `0`, so the bar always has a fresh value.
 - `delta`: live delta to your best lap in seconds (e.g. `-0.284` = ahead). Empty while there is no reference lap. iRacing uses its own `LapDeltaToBestLap`; other games use SimHub's delta to the session best.
 - `invalid`: `1` from the moment the current lap is invalidated until the next lap starts: off track (iRacing track surface), black flag, black flag warning, meatball, disqualification, or SimHub's own lap-invalidated flag. Otherwise `0`.
+- `flag_state`: `black`, `red`, `yellow` or `green` (race start lights / flags).
 
-The Pi accepts older two-field messages too. Its Racing tile has two sub-modes: Revs shows `<state>`, Hotlap shows the delta (green ahead, yellow behind, red invalid).
-
-### Flag Mode Messages
-- `"red:<rev_pct>"` - Red flag or race start preparation
-- `"yellow:<rev_pct>"` - Yellow flag or race start ready
-- `"green:<rev_pct>"` - Green flag or race start go
-- `"black:<rev_pct>"` - All lights off
-
-### Rev Light Mode Messages
-- `"green:<rev_pct>"` - First shift light threshold reached
-- `"green-yellow:<rev_pct>"` - Second shift light threshold reached
-- `"all_on:<rev_pct>"` - Redline threshold reached
-- `"black:<rev_pct>"` - Below all thresholds
+The Pi also accepts shorter messages from older versions; the test buttons send a single colour.
 
 ## Technical Requirements
 

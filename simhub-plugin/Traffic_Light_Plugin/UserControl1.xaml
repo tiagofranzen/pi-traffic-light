@@ -25,10 +25,10 @@
         <Label Grid.Row="1" Grid.Column="0" Content="UDP Port:" Margin="5" VerticalAlignment="Center"/>
         <TextBox Grid.Row="1" Grid.Column="1" x:Name="UdpPortTextBox" Margin="5" VerticalAlignment="Center"/>
 
-        <Label Grid.Row="2" Grid.Column="0" Content="Mode:" Margin="5" VerticalAlignment="Center"/>
-        <CheckBox Grid.Row="2" Grid.Column="1" x:Name="RevLightsCheckBox" Content="Use Rev Lights" Margin="5" VerticalAlignment="Center"/>
+        <Label Grid.Row="2" Grid.Column="0" Content="Sending:" Margin="5" VerticalAlignment="Top"/>
+        <TextBlock Grid.Row="2" Grid.Column="1" Text="Revs, race start/flags and hotlap delta, all the time. Pick what the light shows in the traffic light app (Racing tile)." Margin="5" TextWrapping="Wrap" VerticalAlignment="Center"/>
 
-        <Label Grid.Row="3" Grid.Column="0" Content="Status:" Margin="5" VerticalAlignment="Center"/>
+        <Label Grid.Row="3" Grid.Column="0" Content="Status:" Margin="5" VerticalAlignment="Top"/>
         <TextBlock Grid.Row="3" Grid.Column="1" x:Name="StatusTextBlock" Text="Waiting for data..." Margin="5" VerticalAlignment="Center" FontWeight="Bold"/>
 
         <Label Grid.Row="4" Grid.Column="0" Content="Manual Test:" Margin="5" VerticalAlignment="Center"/>
