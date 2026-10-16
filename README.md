@@ -31,21 +31,29 @@ yellow, or green in the end.
 
 ## Modes
 
-| Mode | Lights up for | Needs |
-|---|---|---|
-| Auto | A fixed cycle, for when you just want a metronome |, |
-| Manual | Whatever you tap in the UI |, |
-| Emergency | Blinking yellow |, |
-| SOS | Morse SOS, for when it's actually that bad |, |
-| S-Bahn | Minutes to your next train | Deutsche Bahn API keys |
-| Stau | How bad your commute is right now | TomTom or Google Maps key |
-| Biergarten | Temperature / weather / time of day | OpenWeatherMap key |
-| UV | Current UV index |, |
-| Space | Geomagnetic Kp index (aurora/storm risk) |, |
-| Party | Listens to the room and hops to a random lamp on every beat. Music without a clear beat hops on the loudest hits; silence stays dark | a USB mic |
-| Racing | Live flags + rev bar from iRacing, via [`simhub-plugin/`](simhub-plugin) | the plugin, UDP → port 9001 |
-| Grêmio | Last match result |, (ESPN) |
-| Clock | Chimes like an old striking clock: lamps filling up (green, +yellow, +red) or down (red, +yellow, +green), then all off - 1/2/3/4 sweeps (up, up-down, up-down-up, up-down-up-down) at :15/:30/:45/:00, then one yellow blink per hour. Dark between chimes. Quiet 23:00-07:00 |, |
+Eight tiles on the home screen. Weather, Commute, Alerts and Party hold
+sub-modes: tap the tile to start the one you used last, then pick another
+from the chips under the light, which also show what each colour means.
+
+| Tile | Sub-mode | Lights up for | Needs |
+|---|---|---|---|
+| Traffic light | | A normal traffic light cycle |, |
+| Weather | Biergarten | Temperature / weather / time of day | OpenWeatherMap key |
+| | UV | Current UV index |, |
+| | Space | Geomagnetic Kp index (aurora/storm risk) |, |
+| | Temperature | Outside temperature: green 15-26°C, yellow 5-15 or 26-30°C, red beyond |, |
+| | Rain | Rain forecast: green dry for 3 h, yellow rain within 3 h, red raining or within the hour |, |
+| Commute | S-Bahn | Minutes to your next train | Deutsche Bahn API keys |
+| | Stau | How bad your commute is right now | TomTom or Google Maps key |
+| Alerts | Blinking | Blinking yellow |, |
+| | SOS | Morse SOS, for when it's actually that bad |, |
+| Party | Music | Hops to a random lamp on every beat. Music without a clear beat hops on the loudest hits; silence stays dark | a USB mic |
+| | VU meter | Mic level: green, then green + yellow, then all three | a USB mic |
+| Racing | | Live flags + rev bar from iRacing, via [`simhub-plugin/`](simhub-plugin) | the plugin, UDP → port 9001 |
+| Grêmio | | Last match result |, (ESPN) |
+| Clock | | Chimes like an old striking clock: lamps filling up (green, +yellow, +red) or down (red, +yellow, +green), then all off - 1/2/3/4 sweeps at :15/:30/:45/:00, then one yellow blink per hour. Dark between chimes. Quiet 23:00-07:00 |, |
+
+Tapping a lamp directly switches to manual: it stays on whatever you tapped.
 
 No API key, no drama, those modes just sit there looking pretty instead
 of doing anything useful.
