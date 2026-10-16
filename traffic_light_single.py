@@ -53,6 +53,10 @@ AUTO_RED_YELLOW_DURATION = 2.0
 EMERGENCY_BLINK_INTERVAL = 0.5
 CONTROLLER_LOOP_SLEEP = 0.2
 RACING_STEP_DURATION = 1.0
+# Hotlap (Racing sub-mode): live delta to your best lap from the SimHub plugin.
+HOTLAP_DEADBAND = 0.03       # +-s around 0 where the colour holds, so being exactly on pace doesn't chatter the relays
+HOTLAP_MIN_SWITCH = 0.25     # s between green/yellow changes (red always switches at once)
+HOTLAP_STALE_SECONDS = 2.0   # no packet from the plugin for this long -> lights off
 S_BAHN_POLL_INTERVAL = 30.0
 WEATHER_POLL_INTERVAL = 900.0
 SPACE_POLL_INTERVAL = 900.0
@@ -228,6 +232,9 @@ class SharedState:
     weather_status: Dict = field(default_factory=dict)
     iracing_light_status: str = "black"
     iracing_rev_pct: Optional[float] = None
+    iracing_delta: Optional[float] = None
+    iracing_lap_invalid: bool = False
+    iracing_last_rx: float = 0.0
     space_weather_status: Dict = field(default_factory=dict)
     traffic_status: Dict = field(default_factory=dict)
     environment_status: Dict = field(default_factory=dict)
@@ -269,6 +276,9 @@ class SharedState:
             'weather': self.weather_status.copy(),
             'race_step': self.mode_state.get('race_step', 0),
             'iracing_rev_pct': self.iracing_rev_pct,
+            'iracing_delta': self.iracing_delta,
+            'iracing_lap_invalid': self.iracing_lap_invalid,
+            'iracing_live': time() - self.iracing_last_rx < HOTLAP_STALE_SECONDS,
             'space_weather': self.space_weather_status.copy(),
             'traffic': self.traffic_status.copy(),
             'environment': self.environment_status.copy(),
@@ -381,6 +391,25 @@ def handle_racing_mode(controller, elapsed: float) -> Optional[float]:
         elif step == 3 and elapsed > RACING_STEP_DURATION: controller.set_light_state('off'); s.mode_state['race_step'] += 1; s.last_state_change_time = time()
     else:
         live = s.iracing_light_status if s.iracing_light_status != 'black' else 'off'; controller.set_light_state(live); return 0.05
+
+def handle_hotlap_mode(controller, elapsed: float) -> Optional[float]:
+    s = controller.state; now = time(); c = s.current_color
+    if now - s.iracing_last_rx > HOTLAP_STALE_SECONDS:
+        controller.set_light_state('off'); return 0.1
+    if s.iracing_lap_invalid:
+        controller.set_light_state('red'); return 0.02  # overrides the delta, immediately
+    d = s.iracing_delta
+    if d is None:
+        controller.set_light_state('off'); return 0.05  # no reference lap yet
+    if d < -HOTLAP_DEADBAND: want = 'green'
+    elif d > HOTLAP_DEADBAND: want = 'yellow'
+    else: want = c if c in ('green', 'yellow') else 'yellow'
+    if want != c and c in ('green', 'yellow') and now - s.mode_state.get('hotlap_switch', 0.0) < HOTLAP_MIN_SWITCH:
+        return 0.02
+    if want != c:
+        s.mode_state['hotlap_switch'] = now
+    controller.set_light_state(want)
+    return 0.02
 
 def handle_space_mode(controller, elapsed: float) -> Optional[float]:
     kp = controller.state.space_weather_status.get('kp_index'); c = controller.state.current_color
@@ -1554,19 +1583,25 @@ def iracing_udp_listener(controller):
                 try:
                     data, _ = sock.recvfrom(1024)
                     payload = data.decode('utf-8').strip()
-                    # Wire format is "<color>" or "<color>:<revpct>"; the rev
-                    # percentage is optional so older senders keep working.
-                    color, _, rev_raw = payload.partition(':')
+                    # Wire format is "<color>[:<revpct>[:<delta>:<invalid>]]"; the
+                    # extra fields are optional so older senders keep working.
+                    # delta = seconds vs your best lap (empty = no reference yet),
+                    # invalid = 1 once the current lap is invalidated.
+                    fields = payload.split(':')
+                    color = fields[0]
                     if color in valid:
-                        rev_pct = None
-                        if rev_raw:
+                        def num(i, lo=None, hi=None):
                             try:
-                                rev_pct = max(0.0, min(100.0, float(rev_raw)))
-                            except ValueError:
-                                rev_pct = None
+                                v = float(fields[i])
+                            except (IndexError, ValueError):
+                                return None
+                            return v if lo is None else max(lo, min(hi, v))
                         with controller.state.lock:
                             controller.state.iracing_light_status = color
-                            controller.state.iracing_rev_pct = rev_pct
+                            controller.state.iracing_rev_pct = num(1, 0.0, 100.0)
+                            controller.state.iracing_delta = num(2)
+                            controller.state.iracing_lap_invalid = len(fields) > 3 and fields[3] == '1'
+                            controller.state.iracing_last_rx = time()
                 except socket.timeout: continue
                 except Exception: continue
     except Exception as e:
@@ -1606,17 +1641,16 @@ _HTML = f"""
     .mode-buttons a svg{{width:20px;height:20px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}}
     .mode-buttons a span{{font-size:.68em;font-weight:600;letter-spacing:.01em}}
     .mode-buttons a.active{{background:rgba(255,255,255,.06);border-color:#4a4d55;color:#f1f2f4}}
-    .mode-buttons a span.tile-sub{{font-size:.58em;font-weight:500;opacity:.8;min-height:1.15em;margin-top:-3px}}
     #modeText strong em{{font-style:normal;color:var(--text-muted);font-weight:600}}
-    .subs{{width:100%;height:70px;display:flex;flex-direction:column;gap:8px;padding-top:10px;border-top:1px solid var(--panel-border)}}
+    .subs{{width:100%;height:76px;display:flex;flex-direction:column;gap:6px;padding-top:9px;border-top:1px solid var(--panel-border)}}
     .subs.empty{{visibility:hidden}}
     .chips{{display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch;flex:none}}
     .chips::-webkit-scrollbar{{display:none}}
     .chips .chip:first-child{{margin-left:auto}}
     .chips .chip:last-child{{margin-right:auto}}
-    .chip{{flex:none;font:600 .76em -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:var(--text-muted);background:rgba(255,255,255,.045);border:1px solid var(--panel-border);border-radius:999px;padding:6px 10px;cursor:pointer;touch-action:manipulation}}
+    .chip{{flex:none;font:600 .76em -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:var(--text-muted);background:rgba(255,255,255,.045);border:1px solid var(--panel-border);border-radius:999px;padding:5px 10px;cursor:pointer;touch-action:manipulation}}
     .chip.active{{color:var(--text-color);background:rgba(255,255,255,.09);border-color:#4a4d55}}
-    .rule{{display:flex;justify-content:center;align-content:flex-start;gap:2px 12px;flex-wrap:wrap;font-size:.72em;line-height:1.35;color:var(--text-muted);height:2.7em;overflow:hidden}}
+    .rule{{flex:none;display:flex;justify-content:center;align-content:flex-start;gap:0 12px;flex-wrap:wrap;font-size:.72em;line-height:1.4;color:var(--text-muted);height:2.8em;overflow:hidden}}
     .rule span{{display:flex;align-items:center;gap:5px}}
     .rule b{{width:8px;height:8px;border-radius:50%;flex:none}}
     .stage{{position:relative;width:fit-content;margin:0 auto}}
@@ -1640,14 +1674,14 @@ _HTML = f"""
     </div>
     <div class="section-label">Modes</div>
     <div class="mode-buttons">
-    <a href="#" id="group-auto" onclick="event.preventDefault(); handleGroupClick('auto')"><svg viewBox="0 0 24 24"><rect x="8" y="2.5" width="8" height="19" rx="3"/><circle cx="12" cy="7" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="12" cy="17" r="1.6"/></svg><span>Traffic light</span><span class="tile-sub" id="groupSub-auto"></span></a>
-    <a href="#" id="group-clock" onclick="event.preventDefault(); handleGroupClick('clock')"><svg viewBox="0 0 24 24"><path d="M6 16V11a6 6 0 0 1 12 0v5l1.5 2h-15z"/><path d="M10 20.5a2 2 0 0 0 4 0"/><path d="M12 3v2"/></svg><span>Clock</span><span class="tile-sub" id="groupSub-clock"></span></a>
-    <a href="#" id="group-weather" onclick="event.preventDefault(); handleGroupClick('weather')"><svg viewBox="0 0 24 24"><path d="M7 18h10a4 4 0 0 0 0-8 5.5 5.5 0 0 0-10.6 1.5A3.3 3.3 0 0 0 7 18z"/></svg><span>Weather</span><span class="tile-sub" id="groupSub-weather"></span></a>
-    <a href="#" id="group-commute" onclick="event.preventDefault(); handleGroupClick('commute')"><svg viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="14" rx="4"/><path d="M5 14h14M9 18l-2 3M15 18l2 3"/><circle cx="9" cy="10" r="1"/><circle cx="15" cy="10" r="1"/></svg><span>Commute</span><span class="tile-sub" id="groupSub-commute"></span></a>
-    <a href="#" id="group-party" onclick="event.preventDefault(); handleGroupClick('party')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M6 6l2 2M16 16l2 2M6 18l2-2M16 8l2-2"/></svg><span>Party</span><span class="tile-sub" id="groupSub-party"></span></a>
-    <a href="#" id="group-racing" onclick="event.preventDefault(); handleGroupClick('racing')"><svg viewBox="0 0 24 24"><path d="M6 3v18"/><path d="M6 4h11l-2 3 2 3H6"/></svg><span>Racing</span><span class="tile-sub" id="groupSub-racing"></span></a>
-    <a href="#" id="group-gremio" onclick="event.preventDefault(); handleGroupClick('gremio')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3.5 9 Q12 12.2 20.5 9"/><path d="M3.5 15 Q12 11.8 20.5 15"/></svg><span>Grêmio</span><span class="tile-sub" id="groupSub-gremio"></span></a>
-    <a href="#" id="group-alerts" onclick="event.preventDefault(); handleGroupClick('alerts')"><svg viewBox="0 0 24 24"><path d="M12 3 2.5 20h19L12 3z"/><path d="M12 9.5v4.5"/><circle cx="12" cy="17" r="1" fill="currentColor" stroke="none"/></svg><span>Alerts</span><span class="tile-sub" id="groupSub-alerts"></span></a>
+    <a href="#" id="group-auto" onclick="event.preventDefault(); handleGroupClick('auto')"><svg viewBox="0 0 24 24"><rect x="8" y="2.5" width="8" height="19" rx="3"/><circle cx="12" cy="7" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="12" cy="17" r="1.6"/></svg><span>Traffic light</span></a>
+    <a href="#" id="group-clock" onclick="event.preventDefault(); handleGroupClick('clock')"><svg viewBox="0 0 24 24"><path d="M6 16V11a6 6 0 0 1 12 0v5l1.5 2h-15z"/><path d="M10 20.5a2 2 0 0 0 4 0"/><path d="M12 3v2"/></svg><span>Clock</span></a>
+    <a href="#" id="group-weather" onclick="event.preventDefault(); handleGroupClick('weather')"><svg viewBox="0 0 24 24"><path d="M7 18h10a4 4 0 0 0 0-8 5.5 5.5 0 0 0-10.6 1.5A3.3 3.3 0 0 0 7 18z"/></svg><span>Weather</span></a>
+    <a href="#" id="group-commute" onclick="event.preventDefault(); handleGroupClick('commute')"><svg viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="14" rx="4"/><path d="M5 14h14M9 18l-2 3M15 18l2 3"/><circle cx="9" cy="10" r="1"/><circle cx="15" cy="10" r="1"/></svg><span>Commute</span></a>
+    <a href="#" id="group-party" onclick="event.preventDefault(); handleGroupClick('party')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M6 6l2 2M16 16l2 2M6 18l2-2M16 8l2-2"/></svg><span>Party</span></a>
+    <a href="#" id="group-racing" onclick="event.preventDefault(); handleGroupClick('racing')"><svg viewBox="0 0 24 24"><path d="M6 3v18"/><path d="M6 4h11l-2 3 2 3H6"/></svg><span>Racing</span></a>
+    <a href="#" id="group-gremio" onclick="event.preventDefault(); handleGroupClick('gremio')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3.5 9 Q12 12.2 20.5 9"/><path d="M3.5 15 Q12 11.8 20.5 15"/></svg><span>Grêmio</span></a>
+    <a href="#" id="group-alerts" onclick="event.preventDefault(); handleGroupClick('alerts')"><svg viewBox="0 0 24 24"><path d="M12 3 2.5 20h19L12 3z"/><path d="M12 9.5v4.5"/><circle cx="12" cy="17" r="1" fill="currentColor" stroke="none"/></svg><span>Alerts</span></a>
     </div>
     </div>
     <script>
@@ -1659,13 +1693,13 @@ _HTML = f"""
             commute: {{name: 'Commute', modes: ['s_bahn', 'stau']}},
             alerts: {{name: 'Alerts', modes: ['emergency', 'sos']}},
             party: {{name: 'Party', modes: ['party', 'audio_vu']}},
-            racing: {{name: 'Racing', modes: ['racing']}},
+            racing: {{name: 'Racing', modes: ['racing', 'hotlap']}},
             gremio: {{name: 'Grêmio', modes: ['gremio']}},
             clock: {{name: 'Clock', modes: ['clock']}},
         }};
         // Sub-mode name and colour ranges (r/y/g/a = red/yellow/green/all), from the Pi's own settings.
         const SUBS = {{
-            biergarten: {{name: 'Biergarten', rule: [['g', '18°C+, clear, after 16h'], ['y', '15–18°C or cloudy'], ['r', 'rain, below 15°C, before 16h']]}},
+            biergarten: {{name: 'Biergarten', rule: [['g', '18°C+, clear, from 16h'], ['y', '15–18°C or cloudy'], ['r', 'rain, cold, before 16h']]}},
             uv: {{name: 'UV', rule: [['g', 'UV under 3'], ['y', '3–5'], ['r', '6+ (blinks at 8+)']]}},
             space: {{name: 'Space', rule: [['g', 'Kp 3 or less'], ['y', 'Kp 4'], ['r', 'Kp 5+ storm (blinks)']]}},
             temp: {{name: 'Temperature', chip: 'Temp', rule: [['g', '{TEMP_GREEN_RANGE[0]:g}–{TEMP_GREEN_RANGE[1]:g}°C'], ['y', '{TEMP_YELLOW_RANGE[0]:g}–{TEMP_GREEN_RANGE[0]:g} or {TEMP_GREEN_RANGE[1]:g}–{TEMP_YELLOW_RANGE[1]:g}°C'], ['r', 'below {TEMP_YELLOW_RANGE[0]:g} or above {TEMP_YELLOW_RANGE[1]:g}°C']]}},
@@ -1674,6 +1708,8 @@ _HTML = f"""
             stau: {{name: 'Stau', rule: [['g', 'delay under 20%'], ['y', '20–45%'], ['r', '45%+']]}},
             emergency: {{name: 'Blinking', rule: [['y', 'blinks every {EMERGENCY_BLINK_INTERVAL:g} s']]}},
             sos: {{name: 'SOS', rule: [['a', 'Morse SOS on all lamps']]}},
+            racing: {{name: 'Revs', rule: [['g', 'shift light'], ['y', 'shift now (green + yellow)'], ['r', 'redline (all)']]}},
+            hotlap: {{name: 'Hotlap', rule: [['g', 'faster than your best lap'], ['y', 'slower'], ['r', 'lap invalid']]}},
             party: {{name: 'Music', rule: [['a', 'random lamp on every beat'], ['a', 'dark in silence']]}},
             audio_vu: {{name: 'VU meter', rule: [['g', 'quiet'], ['y', 'loud (green + yellow)'], ['r', 'very loud (all)']]}},
         }};
@@ -1688,11 +1724,7 @@ _HTML = f"""
             try {{ localStorage.setItem('tl_lastSub', JSON.stringify(lastSub)); }} catch (e) {{}}
         }}
         function renderGroups(mode) {{
-            Object.entries(GROUPS).forEach(([g, d]) => {{
-                const tile = document.getElementById(`group-${{g}}`);
-                tile.classList.toggle('active', GROUP_OF[mode] === g);
-                if (d.modes.length > 1) document.getElementById(`groupSub-${{g}}`).textContent = SUBS[lastSub[g] || d.modes[0]].name;
-            }});
+            Object.keys(GROUPS).forEach(g => document.getElementById(`group-${{g}}`).classList.toggle('active', GROUP_OF[mode] === g));
             const g = GROUP_OF[mode], subs = document.getElementById('subs');
             if (!g || GROUPS[g].modes.length < 2) {{ subs.classList.add('empty'); return; }}
             subs.classList.remove('empty');
@@ -1741,6 +1773,10 @@ _HTML = f"""
             }}
             if (mode === 'audio_vu') {{
                 return Math.max(0, Math.min(1, audio_level || 0));
+            }}
+            if (mode === 'hotlap') {{
+                const d = lastStatus.iracing_delta;
+                return (lastStatus.iracing_live && typeof d === 'number' && !lastStatus.iracing_lap_invalid) ? Math.min(1, Math.abs(d)) : null;
             }}
             if (mode === 'temp') {{
                 const v = (environment || {{}}).temp;
@@ -1800,6 +1836,13 @@ _HTML = f"""
             else if (mode === 'biergarten') {{
                 if (weather && weather.temp && weather.condition) {{ infoDisplay.textContent = `${{weather.temp.toFixed(1)}}°C, ${{weather.condition}}`; }}
                 else {{ infoDisplay.textContent = 'No weather data.'; }}
+            }}
+            else if (mode === 'hotlap') {{
+                const d = lastStatus.iracing_delta;
+                if (!lastStatus.iracing_live) infoDisplay.textContent = 'Listening for iRacing...';
+                else if (lastStatus.iracing_lap_invalid) infoDisplay.textContent = 'Lap invalid. Next lap counts again.';
+                else if (typeof d !== 'number') infoDisplay.textContent = 'Set a lap first: no reference yet.';
+                else infoDisplay.textContent = `${{d < 0 ? '−' : '+'}}${{Math.abs(d).toFixed(2)}} s vs your best lap`;
             }}
             else if (mode === 'racing' && race_step >= 4) {{
                 infoDisplay.textContent = (typeof iracing_rev_pct === 'number') ? `Revs: ${{Math.round(iracing_rev_pct)}}%` : 'Listening for iRacing...';
@@ -1989,7 +2032,9 @@ _HTML = f"""
             pill.className = ok ? 'conn-pill live' : 'conn-pill lost';
             label.textContent = ok ? 'Live' : 'Reconnecting…';
         }}
+        let lastStatus = {{}};
         function applyStatus(status) {{
+            lastStatus = status;
             if (localAnimationId) return;
             updateVisuals(status.color, status.mode, status.s_bahn_minutes, status.weather, status.race_step, status.space_weather, status.traffic, status.party, status.s_bahn_transit, status.environment, status.gremio, status.iracing_rev_pct, status.audio_level);
         }}
@@ -2082,6 +2127,7 @@ class TrafficLightController:
             's_bahn': handle_s_bahn_mode,
             'biergarten': handle_biergarten_mode,
             'racing': handle_racing_mode,
+            'hotlap': handle_hotlap_mode,
             'space': handle_space_mode,
             'stau': handle_stau_mode,
             'uv': handle_uv_mode,
@@ -2199,6 +2245,8 @@ class TrafficLightController:
             self.set_light_state(self.state.mode_state['sos_pattern'][0]['state'])
         elif new_mode == 'racing':
             self.state.mode_state['race_step'] = 0; self.set_light_state('off')
+        elif new_mode == 'hotlap':
+            self.set_light_state('off')
         elif new_mode == 'audio_vu':
             now = time(); ms = self.state.mode_state
             self.set_light_state('off'); self.state.audio_vu_level = 0.0
