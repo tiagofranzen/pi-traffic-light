@@ -26,6 +26,10 @@ namespace SimHub.Plugins.TrafficLight
 
         private bool _initSequenceComplete = false;
 
+        // Hotlap: the current lap stays invalid from the first infraction until the next lap starts.
+        private int _lapNumber = -1;
+        private bool _lapInvalid = false;
+
         public PluginManager PluginManager { get; set; }
 
         public void Init(PluginManager pluginManager)
@@ -116,8 +120,75 @@ namespace SimHub.Plugins.TrafficLight
                 messageToSend = currentState;
             }
 
-            // Sent every tick (not just on state change) so the rev_pct bar never freezes on a stale value
-            SendUdpMessage($"{messageToSend}:{revPct.ToString("0.#", CultureInfo.InvariantCulture)}");
+            // Hotlap fields: live delta to your best lap (empty = no reference yet) and whether this lap is invalid.
+            double? delta = ReadLapDelta(pluginManager, data);
+            bool lapInvalid = UpdateLapInvalid(pluginManager, data);
+            string deltaText = delta.HasValue ? delta.Value.ToString("0.000", CultureInfo.InvariantCulture) : "";
+            _settingsControl?.Dispatcher.Invoke(() => _settingsControl.AppendHotlapStatus(
+                delta.HasValue ? $"Delta: {deltaText} s | Lap {(lapInvalid ? "INVALID" : "valid")}" : $"Delta: no reference lap | Lap {(lapInvalid ? "INVALID" : "valid")}"));
+
+            // Sent every tick (not just on state change) so the rev_pct bar never freezes on a stale value.
+            // Format: <state>:<rev_pct>:<delta>:<invalid>
+            SendUdpMessage($"{messageToSend}:{revPct.ToString("0.#", CultureInfo.InvariantCulture)}:{deltaText}:{(lapInvalid ? 1 : 0)}");
+        }
+
+        private double? ReadLapDelta(PluginManager pluginManager, GameData data)
+        {
+            // iRacing's own delta to your best lap, only when iRacing says it's usable.
+            if (data.GameName == "IRacing")
+            {
+                if (GetPropertyBoolSafe(pluginManager, "DataCorePlugin.GameRawData.Telemetry.LapDeltaToBestLap_OK"))
+                    return GetPropertyDoubleSafe(pluginManager, "DataCorePlugin.GameRawData.Telemetry.LapDeltaToBestLap");
+                return null;
+            }
+            // Other games: SimHub's own live delta to the session best.
+            return data.NewData.DeltaToSessionBest;
+        }
+
+        private bool UpdateLapInvalid(PluginManager pluginManager, GameData data)
+        {
+            bool iRacing = data.GameName == "IRacing";
+            int lap = iRacing ? (int)GetPropertyDoubleSafe(pluginManager, "DataCorePlugin.GameRawData.Telemetry.Lap") : data.NewData.CurrentLap;
+            if (lap != _lapNumber)
+            {
+                _lapNumber = lap;
+                _lapInvalid = false; // a new lap starts clean
+            }
+
+            bool infraction = data.NewData.LapInvalidated;
+            if (iRacing)
+            {
+                // Track limits: the player's car is off the racing surface.
+                int carIdx = (int)GetPropertyDoubleSafe(pluginManager, "DataCorePlugin.GameRawData.SessionData.DriverInfo.DriverCarIdx");
+                if (pluginManager.GetPropertyValue("DataCorePlugin.GameRawData.Telemetry.CarIdxTrackSurface") is Array surfaces
+                    && carIdx >= 0 && carIdx < surfaces.Length
+                    && Convert.ToString(surfaces.GetValue(carIdx)) == "OffTrack")
+                {
+                    infraction = true;
+                }
+                // Penalties: black flag, black flag warning, meatball (repair) or disqualification.
+                foreach (string flag in new[] { "Isblack", "Isfurled", "Isrepair", "Isdisqualify" })
+                {
+                    if (GetPropertyBoolSafe(pluginManager, "DataCorePlugin.GameRawData.Telemetry.SessionFlagsDetails." + flag))
+                        infraction = true;
+                }
+            }
+
+            if (infraction) _lapInvalid = true;
+            return _lapInvalid;
+        }
+
+        private bool GetPropertyBoolSafe(PluginManager pluginManager, string propertyName)
+        {
+            try
+            {
+                object value = pluginManager.GetPropertyValue(propertyName);
+                return value != null && Convert.ToBoolean(value);
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private double GetPropertyDoubleSafe(PluginManager pluginManager, string propertyName)

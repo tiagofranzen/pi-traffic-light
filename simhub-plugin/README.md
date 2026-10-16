@@ -43,7 +43,13 @@ Use the built-in test buttons to verify your hardware setup:
 
 ## UDP Protocol
 
-The plugin sends simple UTF-8 text messages, one every tick, in the form `"<state>:<rev_pct>"` where `rev_pct` is the current RPM as a percentage of redline (0-100, e.g. `42.7`). It is sent on every tick, including `0`, so the bar always has a fresh value to display.
+The plugin sends simple UTF-8 text messages, one every tick, in the form `"<state>:<rev_pct>:<delta>:<invalid>"`:
+
+- `rev_pct`: current RPM as a percentage of redline (0-100, e.g. `42.7`). Sent on every tick, including `0`, so the bar always has a fresh value to display.
+- `delta`: live delta to your best lap in seconds (e.g. `-0.284` = ahead). Empty while there is no reference lap. iRacing uses its own `LapDeltaToBestLap`; other games use SimHub's delta to the session best.
+- `invalid`: `1` from the moment the current lap is invalidated until the next lap starts: off track (iRacing track surface), black flag, black flag warning, meatball, disqualification, or SimHub's own lap-invalidated flag. Otherwise `0`.
+
+The Pi accepts older two-field messages too. Its Racing tile has two sub-modes: Revs shows `<state>`, Hotlap shows the delta (green ahead, yellow behind, red invalid).
 
 ### Flag Mode Messages
 - `"red:<rev_pct>"` - Red flag or race start preparation
