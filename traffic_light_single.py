@@ -52,7 +52,13 @@ AUTO_RED_DURATION = 20.0
 AUTO_RED_YELLOW_DURATION = 2.0
 EMERGENCY_BLINK_INTERVAL = 0.5
 CONTROLLER_LOOP_SLEEP = 0.2
-RACING_STEP_DURATION = 1.0
+# Intro played when a Racing sub-mode is selected: (lamps, seconds) steps.
+_REV_SWEEP = ['green', 'green-yellow', 'all_on', 'green-yellow', 'green', 'off']
+RACING_INTROS = {
+    'race_start': [('off', 1.0), ('red', 1.0), ('red_and_yellow', 1.0), ('all_on', 1.0), ('off', 0.5)],  # start lights
+    'racing': [(c, 0.15) for c in _REV_SWEEP * 2],                                                       # two quick revs
+    'hotlap': [('green', 0.4), ('yellow', 0.4), ('green', 0.4), ('yellow', 0.4), ('red', 0.8), ('off', 0.4)],  # delta battle, then invalid
+}
 # Hotlap (Racing sub-mode): live delta to your best lap from the SimHub plugin.
 HOTLAP_DEADBAND = 0.03       # +-s around 0 where the colour holds, so being exactly on pace doesn't chatter the relays
 HOTLAP_MIN_SWITCH = 0.25     # s between green/yellow changes (red always switches at once)
@@ -246,7 +252,6 @@ class SharedState:
     mode_state: Dict = field(default_factory=lambda: {
         'next_auto_state': 'green',
         'sos_index': 0,
-        'race_step': 0,
         'sos_pattern': [
             {'state': 'all_on', 'duration': 0.2}, {'state': 'off', 'duration': 0.2},
             {'state': 'all_on', 'duration': 0.2}, {'state': 'off', 'duration': 0.2},
@@ -275,7 +280,7 @@ class SharedState:
             's_bahn_minutes': self.s_bahn_minutes_away,
             's_bahn_transit': self.s_bahn_transit_status.copy(),
             'weather': self.weather_status.copy(),
-            'race_step': self.mode_state.get('race_step', 0),
+            'race_step': 0 if self.mode_state.get('intro_seq') else 4,  # the web UI waits for the intro to finish
             'iracing_rev_pct': self.iracing_rev_pct,
             'iracing_delta': self.iracing_delta,
             'iracing_lap_invalid': self.iracing_lap_invalid,
@@ -384,18 +389,35 @@ def handle_biergarten_mode(controller, elapsed: float) -> Optional[float]:
     elif temp < 18 or 'Clouds' in cond: controller.set_light_state('yellow')
     else: controller.set_light_state('green')
 
+def _play_intro(controller) -> Optional[float]:
+    """Step through the sub-mode's intro; returns a sleep while it plays, None once it's done."""
+    ms = controller.state.mode_state; seq = ms.get('intro_seq')
+    if not seq:
+        return None
+    now = time()
+    if now < ms.get('intro_until', 0.0):
+        return 0.02
+    idx = ms.get('intro_idx', -1) + 1
+    if idx >= len(seq):
+        ms['intro_seq'] = None
+        return None
+    color, dur = seq[idx]
+    controller.set_light_state(color)
+    ms['intro_idx'] = idx; ms['intro_until'] = now + dur
+    return 0.02
+
 def handle_racing_mode(controller, elapsed: float) -> Optional[float]:
-    s = controller.state; step = s.mode_state['race_step']
-    if step < 4:
-        if step == 0 and elapsed > RACING_STEP_DURATION: controller.set_light_state('red'); s.mode_state['race_step'] += 1; s.last_state_change_time = time()
-        elif step == 1 and elapsed > RACING_STEP_DURATION: controller.set_light_state('red_and_yellow'); s.mode_state['race_step'] += 1; s.last_state_change_time = time()
-        elif step == 2 and elapsed > RACING_STEP_DURATION: controller.set_light_state('all_on'); s.mode_state['race_step'] += 1; s.last_state_change_time = time()
-        elif step == 3 and elapsed > RACING_STEP_DURATION: controller.set_light_state('off'); s.mode_state['race_step'] += 1; s.last_state_change_time = time()
-    else:
-        live = s.iracing_light_status if s.iracing_light_status != 'black' else 'off'; controller.set_light_state(live); return 0.05
+    intro = _play_intro(controller)
+    if intro is not None:
+        return intro
+    s = controller.state
+    live = s.iracing_light_status if s.iracing_light_status != 'black' else 'off'; controller.set_light_state(live); return 0.05
 
 def handle_race_start_mode(controller, elapsed: float) -> Optional[float]:
     # Race start lights and flags from the plugin: red = lights set, yellow = get ready / yellow flag, green = go.
+    intro = _play_intro(controller)
+    if intro is not None:
+        return intro
     s = controller.state
     if time() - s.iracing_last_rx > HOTLAP_STALE_SECONDS:
         controller.set_light_state('off'); return 0.1
@@ -404,6 +426,9 @@ def handle_race_start_mode(controller, elapsed: float) -> Optional[float]:
     return 0.02
 
 def handle_hotlap_mode(controller, elapsed: float) -> Optional[float]:
+    intro = _play_intro(controller)
+    if intro is not None:
+        return intro
     s = controller.state; now = time(); c = s.current_color
     if now - s.iracing_last_rx > HOTLAP_STALE_SECONDS:
         controller.set_light_state('off'); return 0.1
@@ -2275,10 +2300,8 @@ class TrafficLightController:
             self.state.mode_state['sos_index'] = 0
             # Apply the first pattern step on entry; handler advances after its duration.
             self.set_light_state(self.state.mode_state['sos_pattern'][0]['state'])
-        elif new_mode == 'racing':
-            self.state.mode_state['race_step'] = 0; self.set_light_state('off')
-        elif new_mode in ('hotlap', 'race_start'):
-            self.set_light_state('off')
+        elif new_mode in RACING_INTROS:
+            self.state.mode_state.update(intro_seq=RACING_INTROS[new_mode], intro_idx=-1, intro_until=0.0)
         elif new_mode == 'audio_vu':
             now = time(); ms = self.state.mode_state
             self.set_light_state('off'); self.state.audio_vu_level = 0.0
