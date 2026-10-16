@@ -59,7 +59,7 @@ SPACE_POLL_INTERVAL = 900.0
 TRAFFIC_POLL_INTERVAL = 600.0
 NETWORK_POLL_INTERVAL = 10.0
 TRANSIT_POLL_INTERVAL = 600.0
-ENVIRONMENT_POLL_INTERVAL = 1800.0
+ENVIRONMENT_POLL_INTERVAL = 600.0   # also feeds Temperature and Rain, so keep it fresh
 GREMIO_POLL_INTERVAL = 3600.0
 API_TIMEOUT = 15.0
 AUDIO_INPUT_DEVICE = os.getenv("AUDIO_INPUT_DEVICE", "").strip()
@@ -111,6 +111,48 @@ PARTY_LOG_INTERVAL = 5.0           # tracker summary in the journal, for calibra
 # clicks and all) to PARTY_RECORD_DIR, so live behaviour can be replayed offline.
 PARTY_RECORD_SECONDS = 30.0
 PARTY_RECORD_DIR = os.path.expanduser("~/party-cal")
+
+# VU meter (Party sub-mode) - continuous mic-level meter.
+# Level is normalized against a self-adjusting noise floor (an auto-ranging
+# noise gate, not a fixed reference level), so it re-calibrates to whatever
+# room/mic gain it's running in:
+#   - floor tracks the recent quietest level: snaps down fast, creeps up slow.
+#   - ceiling is derived from the floor by a fixed ratio, not tracked
+#     independently (two adaptive envelopes chase each other and go unstable).
+#   - displayed level = (raw - floor) / (floor*ratio - floor), clamped 0..1.
+# Measured with Auto Gain Control off and mic gain 11/16: quiet room ~0.004-0.006 RMS.
+AUDIO_VU_FLOOR_SEED = 0.005
+AUDIO_VU_FLOOR_TAU_DOWN = 1.2   # seconds to mostly settle onto a new, quieter floor
+AUDIO_VU_FLOOR_TAU_UP = 8.0     # seconds to drift the floor up if the room gets noisier
+AUDIO_VU_CEILING_RATIO = 9.0    # "loud" = floor * this
+AUDIO_VU_MIN_RANGE = 0.05       # floor..ceiling floor - guards near-zero floor
+# Hysteresis bands on the normalized 0..1 scale: separate enter/exit thresholds
+# per color so hovering near a boundary can't flap the relay back and forth.
+AUDIO_VU_ENTER_GREEN = 0.16
+AUDIO_VU_EXIT_GREEN = 0.08
+AUDIO_VU_ENTER_YELLOW = 0.50
+AUDIO_VU_EXIT_YELLOW = 0.36
+AUDIO_VU_ENTER_ALL = 0.82
+AUDIO_VU_EXIT_ALL = 0.66
+AUDIO_VU_STALE_SECONDS = 0.12
+AUDIO_VU_MODE_LOOP_SECONDS = 0.02
+AUDIO_VU_SMOOTHING_ATTACK = 0.30
+AUDIO_VU_SMOOTHING_RELEASE = 0.82
+# Relay click decays to baseline within ~120-200ms (measured); mute the level
+# tracker for longer than that so the click's own noise never reaches it.
+AUDIO_VU_RELAY_IGNORE_SECONDS = 0.30
+AUDIO_VU_MIN_STEP_SECONDS = 0.09
+
+# Temperature (Weather sub-mode): green inside the comfortable band, yellow
+# in the outer band, red beyond it.
+TEMP_GREEN_RANGE = (15.0, 26.0)
+TEMP_YELLOW_RANGE = (5.0, 30.0)
+# Rain (Weather sub-mode), from the Open-Meteo hourly forecast: an hour counts
+# as rainy at this much precipitation (mm) or this probability (%).
+RAIN_MM = 0.2
+RAIN_PROBABILITY = 60
+RAIN_RED_MINUTES = 60              # rain this soon (or now) -> red
+RAIN_YELLOW_MINUTES = 180          # rain within this -> yellow, else green
 
 # Clock mode - quarter chimes like an old striking clock, as sweeps along the
 # light (green bottom, red top). Lamps stay on as the sweep adds the next one,
@@ -191,6 +233,7 @@ class SharedState:
     environment_status: Dict = field(default_factory=dict)
     gremio_status: Dict = field(default_factory=dict)
     party_status: Dict = field(default_factory=dict)
+    audio_vu_level: float = 0.0
     network_connected: bool = False
     mode_state: Dict = field(default_factory=lambda: {
         'next_auto_state': 'green',
@@ -208,6 +251,11 @@ class SharedState:
             {'state': 'all_on', 'duration': 0.2}, {'state': 'off', 'duration': 1.5},
         ],
         'click_until': 0.0,
+        'audio_vu_last': 0.0,
+        'audio_vu_ignore_until': 0.0,
+        'audio_vu_last_step_time': 0.0,
+        'audio_vu_floor': AUDIO_VU_FLOOR_SEED,
+        'audio_vu_last_update': 0.0,
     })
     lock: threading.RLock = field(default_factory=threading.RLock)
     running: bool = True
@@ -226,6 +274,7 @@ class SharedState:
             'environment': self.environment_status.copy(),
             'gremio': self.gremio_status.copy(),
             'party': self.party_status.copy(),
+            'audio_level': self.audio_vu_level,
             'network_connected': self.network_connected,
         }
 
@@ -422,6 +471,63 @@ def handle_party_mode(controller, elapsed: float) -> Optional[float]:
     if ms['party_beat_count'] % every == 0:
         _party_hop(controller); ms['party_last_switch'] = now
     return 0.01
+
+def handle_audio_vu_mode(controller, elapsed: float) -> Optional[float]:
+    state = controller.state
+    now = time()
+
+    ignore_until = float(state.mode_state.get('audio_vu_ignore_until', 0.0) or 0.0)
+    if now < ignore_until:
+        return AUDIO_VU_MODE_LOOP_SECONDS
+
+    last = state.mode_state.get('audio_vu_last', 0.0)
+    level = state.audio_vu_level if (now - last) <= AUDIO_VU_STALE_SECONDS else 0.0
+
+    # Hysteresis (a Schmitt trigger): separate enter/exit thresholds per band,
+    # keyed off the color we're currently sitting in, so a level hovering near
+    # a boundary can't flap the relay back and forth every cycle.
+    color = state.current_color
+    if color == 'off':
+        target_color = 'green' if level >= AUDIO_VU_ENTER_GREEN else 'off'
+    elif color == 'green':
+        if level < AUDIO_VU_EXIT_GREEN:
+            target_color = 'off'
+        elif level >= AUDIO_VU_ENTER_YELLOW:
+            target_color = 'green-yellow'
+        else:
+            target_color = 'green'
+    elif color == 'green-yellow':
+        if level < AUDIO_VU_EXIT_YELLOW:
+            target_color = 'green'
+        elif level >= AUDIO_VU_ENTER_ALL:
+            target_color = 'all_on'
+        else:
+            target_color = 'green-yellow'
+    else:  # all_on
+        target_color = 'all_on' if level >= AUDIO_VU_EXIT_ALL else 'green-yellow'
+
+    if target_color != state.current_color:
+        last_step = float(state.mode_state.get('audio_vu_last_step_time', 0.0) or 0.0)
+        if (now - last_step) < AUDIO_VU_MIN_STEP_SECONDS:
+            return AUDIO_VU_MODE_LOOP_SECONDS
+
+    controller.set_light_state(target_color)
+    return AUDIO_VU_MODE_LOOP_SECONDS
+
+def handle_temp_mode(controller, elapsed: float) -> Optional[float]:
+    temp = controller.state.environment_status.get('temp'); c = controller.state.current_color
+    if temp is None: controller.set_light_state('red' if c != 'red' else 'off'); return 0.5
+    if TEMP_GREEN_RANGE[0] <= temp <= TEMP_GREEN_RANGE[1]: controller.set_light_state('green')
+    elif TEMP_YELLOW_RANGE[0] <= temp <= TEMP_YELLOW_RANGE[1]: controller.set_light_state('yellow')
+    else: controller.set_light_state('red')
+
+def handle_rain_mode(controller, elapsed: float) -> Optional[float]:
+    env = controller.state.environment_status; c = controller.state.current_color
+    if 'rain_now' not in env: controller.set_light_state('red' if c != 'red' else 'off'); return 0.5
+    eta = env.get('rain_eta_min')
+    if env['rain_now'] or (eta is not None and eta <= RAIN_RED_MINUTES): controller.set_light_state('red')
+    elif eta is not None and eta <= RAIN_YELLOW_MINUTES: controller.set_light_state('yellow')
+    else: controller.set_light_state('green')
 
 def _clock_quiet(hour: int) -> bool:
     start, end = CLOCK_QUIET_HOURS
@@ -793,6 +899,37 @@ def _level_from_thresholds(value: Optional[float], thresholds: Tuple[float, floa
         return 'moderate'
     return 'high'
 
+def _rain_outlook(current: Dict, hourly: Dict) -> Dict:
+    """Raining now, and minutes until the first rainy hour within the look-ahead."""
+    times = hourly.get('time') or []
+    mm = hourly.get('precipitation') or []
+    prob = hourly.get('precipitation_probability') or []
+    if not times:
+        return {}
+    now = datetime.now()
+    eta: Optional[int] = None; prob_max = 0
+    for i, ts in enumerate(times):
+        try:
+            start = datetime.fromisoformat(ts)
+        except ValueError:
+            continue
+        if start + timedelta(hours=1) <= now:
+            continue  # already over
+        minutes = max(0, int((start - now).total_seconds() // 60))
+        if minutes > RAIN_YELLOW_MINUTES:
+            break
+        p = prob[i] if i < len(prob) and isinstance(prob[i], (int, float)) else 0
+        m = mm[i] if i < len(mm) and isinstance(mm[i], (int, float)) else 0.0
+        prob_max = max(prob_max, int(p))
+        if eta is None and (m >= RAIN_MM or p >= RAIN_PROBABILITY):
+            eta = minutes
+    now_mm = current.get('precipitation')
+    return {
+        'rain_now': bool(isinstance(now_mm, (int, float)) and now_mm >= RAIN_MM / 2),
+        'rain_eta_min': eta,
+        'rain_prob_max': prob_max,
+    }
+
 def _fetch_environment() -> Dict:
     result: Dict = {}
     # Forecast: UV index + is_day + sunrise/sunset
@@ -802,10 +939,11 @@ def _fetch_environment() -> Dict:
             params={
                 'latitude': WEATHER_LAT,
                 'longitude': WEATHER_LON,
-                'current': 'uv_index,is_day',
-                'daily': 'sunrise,sunset',
+                'current': 'uv_index,is_day,temperature_2m,apparent_temperature,precipitation',
+                'daily': 'sunrise,sunset,temperature_2m_max',
+                'hourly': 'precipitation,precipitation_probability',
                 'timezone': 'auto',
-                'forecast_days': 1,
+                'forecast_days': 2,  # so the 3-hour rain look-ahead works late in the evening
             },
             timeout=API_TIMEOUT,
         )
@@ -825,6 +963,13 @@ def _fetch_environment() -> Dict:
             result['sunrise'] = sunrises[0]
         if sunsets:
             result['sunset'] = sunsets[0]
+        for key, src in (('temp', 'temperature_2m'), ('feels_like', 'apparent_temperature')):
+            if isinstance(cur.get(src), (int, float)):
+                result[key] = round(float(cur[src]), 1)
+        highs = daily.get('temperature_2m_max') or []
+        if highs and isinstance(highs[0], (int, float)):
+            result['temp_max'] = round(float(highs[0]), 1)
+        result.update(_rain_outlook(cur, data.get('hourly') or {}))
     except Exception as e:
         logging.warning(f"Open-Meteo forecast fetch failed: {e}")
 
@@ -1179,6 +1324,34 @@ class BeatTracker:
             'hit_strength': round(self.hit_strength, 1),
         }
 
+def _update_vu_level(controller, level: float) -> None:
+    now = time()
+    with controller.state.lock:
+        # The relay clicks audibly when the light switches - drop samples
+        # taken while that click is still ringing out, or the mic picks up
+        # its own relay and re-triggers another switch in a feedback loop.
+        ms = controller.state.mode_state
+        if now < float(ms.get('audio_vu_ignore_until', 0.0) or 0.0):
+            return
+        floor = float(ms.get('audio_vu_floor', AUDIO_VU_FLOOR_SEED) or AUDIO_VU_FLOOR_SEED)
+        last_update = float(ms.get('audio_vu_last_update', now) or now)
+        dt = max(0.0, min(now - last_update, 0.5))
+        ms['audio_vu_last_update'] = now
+
+        # Asymmetric envelope follower: floor snaps down onto quiet fast
+        # but only creeps up slowly - so it settles on "recent quiet",
+        # not an average that a sustained loud stretch would drag upward.
+        floor_tau = AUDIO_VU_FLOOR_TAU_DOWN if level < floor else AUDIO_VU_FLOOR_TAU_UP
+        floor += (level - floor) * (1.0 - math.exp(-dt / floor_tau))
+        ms['audio_vu_floor'] = floor
+
+        ceiling = max(floor * AUDIO_VU_CEILING_RATIO, floor + AUDIO_VU_MIN_RANGE)
+        target = max(0.0, min((level - floor) / (ceiling - floor), 1.0))
+        prev = controller.state.audio_vu_level
+        smoothing = AUDIO_VU_SMOOTHING_ATTACK if target >= prev else AUDIO_VU_SMOOTHING_RELEASE
+        controller.state.audio_vu_level = max(0.0, (prev * smoothing) + (target * (1.0 - smoothing)))
+        ms['audio_vu_last'] = now
+
 def _save_party_recording(np, blocks: List, samplerate: int) -> None:
     import wave
     try:
@@ -1300,10 +1473,15 @@ def audio_monitor(controller):
                         samples = data[:, 0] if data.ndim > 1 else data
                         now = time()
                         with controller.state.lock:
-                            party = controller.state.current_mode == 'party'
+                            mode = controller.state.current_mode
+                            party = mode == 'party'
                             click = now < controller.state.mode_state.get('click_until', 0.0)
                             if not party and active:
                                 controller.state.party_status = {}
+                        if mode == 'audio_vu':
+                            rms = float(np.sqrt(np.mean(np.square(samples))))
+                            peak = float(np.max(np.abs(samples)))
+                            _update_vu_level(controller, max(rms, peak * 0.35))
                         # Only analyse while Party is on; the stream keeps running
                         # so the mic doesn't need re-opening every time.
                         if not party:
@@ -1428,6 +1606,16 @@ _HTML = f"""
     .mode-buttons a svg{{width:20px;height:20px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}}
     .mode-buttons a span{{font-size:.68em;font-weight:600;letter-spacing:.01em}}
     .mode-buttons a.active{{background:rgba(255,255,255,.06);border-color:#4a4d55;color:#f1f2f4}}
+    .mode-buttons a span.tile-sub{{font-size:.58em;font-weight:500;opacity:.8;min-height:1.15em;margin-top:-3px}}
+    #modeText strong em{{font-style:normal;color:var(--text-muted);font-weight:600}}
+    .subs[hidden]{{display:none}}
+    .subs{{width:100%;display:flex;flex-direction:column;gap:8px;padding-top:12px;border-top:1px solid var(--panel-border)}}
+    .chips{{display:flex;flex-wrap:wrap;gap:6px;justify-content:center}}
+    .chip{{font:600 .78em -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:var(--text-muted);background:rgba(255,255,255,.045);border:1px solid var(--panel-border);border-radius:999px;padding:7px 12px;cursor:pointer;touch-action:manipulation}}
+    .chip.active{{color:var(--text-color);background:rgba(255,255,255,.09);border-color:#4a4d55}}
+    .rule{{display:flex;justify-content:center;gap:4px 12px;flex-wrap:wrap;font-size:.74em;color:var(--text-muted);text-align:left}}
+    .rule span{{display:flex;align-items:center;gap:5px}}
+    .rule b{{width:8px;height:8px;border-radius:50%;flex:none}}
     .stage{{position:relative;width:fit-content;margin:0 auto}}
     .led-strip{{position:absolute;top:0;bottom:0;left:100%;margin-left:14px;width:16px;display:flex;flex-direction:column-reverse;gap:4px;padding:2px;opacity:0;pointer-events:none;transition:opacity .15s}}
     .led-strip.visible{{opacity:1}}
@@ -1445,25 +1633,79 @@ _HTML = f"""
     <div class="glass-card">
     <div class="stage"><div class="gremio-stars" id="gremioStars"><svg viewBox="0 0 24 24" fill="#93754F"><path d="M12 2l2.9 6.6L22 9.3l-5 4.8 1.3 7.1L12 17.8 5.7 21.2 7 14.1 2 9.3l7.1-.7z"/></svg><svg viewBox="0 0 24 24" fill="#ABAAAA"><path d="M12 2l2.9 6.6L22 9.3l-5 4.8 1.3 7.1L12 17.8 5.7 21.2 7 14.1 2 9.3l7.1-.7z"/></svg><svg viewBox="0 0 24 24" fill="#F8C300"><path d="M12 2l2.9 6.6L22 9.3l-5 4.8 1.3 7.1L12 17.8 5.7 21.2 7 14.1 2 9.3l7.1-.7z"/></svg></div><div class="traffic-light-body" id="traffic-light"><div id="red" class="light" onclick="handleLightClick('red')"><svg class="gremio-face" id="gremioFaceRed" viewBox="0 0 40 40"></svg></div><div id="yellow" class="light" onclick="handleLightClick('yellow')"><svg class="gremio-face" id="gremioFaceYellow" viewBox="0 0 40 40"></svg></div><div id="green" class="light" onclick="handleLightClick('green')"><svg class="gremio-face" id="gremioFaceGreen" viewBox="0 0 40 40"></svg></div></div><div class="led-strip" id="ledStrip"></div></div>
     <div class="controls"><h2 id="modeText">Current Mode: <strong></strong></h2><div id="info-display" class="info-text"></div></div>
+    <div class="subs" id="subs" hidden><div class="chips" id="chips"></div><div class="rule" id="rule"></div></div>
     </div>
     <div class="section-label">Modes</div>
     <div class="mode-buttons">
-    <a href="#" id="mode-auto" onclick="event.preventDefault(); handleModeClick('auto')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></svg><span>Auto</span></a>
-    <a href="#" id="mode-emergency" onclick="event.preventDefault(); handleModeClick('emergency')"><svg viewBox="0 0 24 24"><path d="M12 3 2.5 20h19L12 3z"/><path d="M12 9.5v4.5"/><circle cx="12" cy="17" r="1" fill="currentColor" stroke="none"/></svg><span>Emergency</span></a>
-    <a href="#" id="mode-sos" onclick="event.preventDefault(); handleModeClick('sos')"><svg viewBox="0 0 24 24"><circle cx="1" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="3" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="5" cy="12" r="1.1" fill="currentColor" stroke="none"/><path d="M7 12h2.4"/><path d="M10.2 12h2.4"/><path d="M13.4 12h2.4"/><circle cx="18.8" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="20.8" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="22.8" cy="12" r="1.1" fill="currentColor" stroke="none"/></svg><span>SOS</span></a>
-    <a href="#" id="mode-s_bahn" onclick="event.preventDefault(); handleModeClick('s_bahn')"><svg viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="14" rx="4"/><path d="M5 14h14M9 18l-2 3M15 18l2 3"/><circle cx="9" cy="10" r="1"/><circle cx="15" cy="10" r="1"/></svg><span>S-Bahn</span></a>
-    <a href="#" id="mode-stau" onclick="event.preventDefault(); handleModeClick('stau')"><svg viewBox="0 0 24 24"><path d="M4 16v-3l2-4h12l2 4v3"/><path d="M4 16h16M7 16v2M17 16v2"/><circle cx="7.5" cy="16.5" r=".5"/><circle cx="16.5" cy="16.5" r=".5"/></svg><span>Stau</span></a>
-    <a href="#" id="mode-biergarten" onclick="event.preventDefault(); handleModeClick('biergarten')"><svg viewBox="0 0 24 24"><path d="M8 6h9v13a2 2 0 0 1-2 2h-5a2 2 0 0 1-2-2z"/><path d="M8 10h9"/><path d="M17 9c3 0 3 6 0 6"/><path d="M9 6q3-3 6 0"/></svg><span>Biergarten</span></a>
-    <a href="#" id="mode-uv" onclick="event.preventDefault(); handleModeClick('uv')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 3v2M12 19v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M3 12h2M19 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"/></svg><span>UV</span></a>
-    <a href="#" id="mode-space" onclick="event.preventDefault(); handleModeClick('space')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><ellipse cx="12" cy="12" rx="9" ry="3.2" transform="rotate(35 12 12)"/></svg><span>Space</span></a>
-    <a href="#" id="mode-party" onclick="event.preventDefault(); handleModeClick('party')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M6 6l2 2M16 16l2 2M6 18l2-2M16 8l2-2"/></svg><span>Party</span></a>
-    <a href="#" id="mode-racing" onclick="event.preventDefault(); handleModeClick('racing')"><svg viewBox="0 0 24 24"><path d="M6 3v18"/><path d="M6 4h11l-2 3 2 3H6"/></svg><span>Racing</span></a>
-    <a href="#" id="mode-gremio" onclick="event.preventDefault(); handleModeClick('gremio')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3.5 9 Q12 12.2 20.5 9"/><path d="M3.5 15 Q12 11.8 20.5 15"/></svg><span>Grêmio</span></a>
-    <a href="#" id="mode-clock" onclick="event.preventDefault(); handleModeClick('clock')"><svg viewBox="0 0 24 24"><path d="M6 16V11a6 6 0 0 1 12 0v5l1.5 2h-15z"/><path d="M10 20.5a2 2 0 0 0 4 0"/><path d="M12 3v2"/></svg><span>Clock</span></a>
+    <a href="#" id="group-auto" onclick="event.preventDefault(); handleGroupClick('auto')"><svg viewBox="0 0 24 24"><rect x="8" y="2.5" width="8" height="19" rx="3"/><circle cx="12" cy="7" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="12" cy="17" r="1.6"/></svg><span>Traffic light</span><span class="tile-sub" id="groupSub-auto"></span></a>
+    <a href="#" id="group-weather" onclick="event.preventDefault(); handleGroupClick('weather')"><svg viewBox="0 0 24 24"><path d="M7 18h10a4 4 0 0 0 0-8 5.5 5.5 0 0 0-10.6 1.5A3.3 3.3 0 0 0 7 18z"/></svg><span>Weather</span><span class="tile-sub" id="groupSub-weather"></span></a>
+    <a href="#" id="group-commute" onclick="event.preventDefault(); handleGroupClick('commute')"><svg viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="14" rx="4"/><path d="M5 14h14M9 18l-2 3M15 18l2 3"/><circle cx="9" cy="10" r="1"/><circle cx="15" cy="10" r="1"/></svg><span>Commute</span><span class="tile-sub" id="groupSub-commute"></span></a>
+    <a href="#" id="group-alerts" onclick="event.preventDefault(); handleGroupClick('alerts')"><svg viewBox="0 0 24 24"><path d="M12 3 2.5 20h19L12 3z"/><path d="M12 9.5v4.5"/><circle cx="12" cy="17" r="1" fill="currentColor" stroke="none"/></svg><span>Alerts</span><span class="tile-sub" id="groupSub-alerts"></span></a>
+    <a href="#" id="group-party" onclick="event.preventDefault(); handleGroupClick('party')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M6 6l2 2M16 16l2 2M6 18l2-2M16 8l2-2"/></svg><span>Party</span><span class="tile-sub" id="groupSub-party"></span></a>
+    <a href="#" id="group-racing" onclick="event.preventDefault(); handleGroupClick('racing')"><svg viewBox="0 0 24 24"><path d="M6 3v18"/><path d="M6 4h11l-2 3 2 3H6"/></svg><span>Racing</span><span class="tile-sub" id="groupSub-racing"></span></a>
+    <a href="#" id="group-gremio" onclick="event.preventDefault(); handleGroupClick('gremio')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3.5 9 Q12 12.2 20.5 9"/><path d="M3.5 15 Q12 11.8 20.5 15"/></svg><span>Grêmio</span><span class="tile-sub" id="groupSub-gremio"></span></a>
+    <a href="#" id="group-clock" onclick="event.preventDefault(); handleGroupClick('clock')"><svg viewBox="0 0 24 24"><path d="M6 16V11a6 6 0 0 1 12 0v5l1.5 2h-15z"/><path d="M10 20.5a2 2 0 0 0 4 0"/><path d="M12 3v2"/></svg><span>Clock</span><span class="tile-sub" id="groupSub-clock"></span></a>
     </div>
     </div>
     <script>
         let currentModeFromServer = 'unknown'; let localAnimationId = null;
+        // Tiles are groups; the Pi only knows the flat modes inside them.
+        const GROUPS = {{
+            auto: {{name: 'Traffic light', modes: ['auto']}},
+            weather: {{name: 'Weather', modes: ['biergarten', 'uv', 'space', 'temp', 'rain']}},
+            commute: {{name: 'Commute', modes: ['s_bahn', 'stau']}},
+            alerts: {{name: 'Alerts', modes: ['emergency', 'sos']}},
+            party: {{name: 'Party', modes: ['party', 'audio_vu']}},
+            racing: {{name: 'Racing', modes: ['racing']}},
+            gremio: {{name: 'Grêmio', modes: ['gremio']}},
+            clock: {{name: 'Clock', modes: ['clock']}},
+        }};
+        // Sub-mode name and colour ranges (r/y/g/a = red/yellow/green/all), from the Pi's own settings.
+        const SUBS = {{
+            biergarten: {{name: 'Biergarten', rule: [['g', '18°C+, clear, after 16:00'], ['y', '15–18°C or cloudy'], ['r', 'rain, below 15°C or before 16:00']]}},
+            uv: {{name: 'UV', rule: [['g', 'UV under 3'], ['y', '3–5'], ['r', '6+ (blinks at 8+)']]}},
+            space: {{name: 'Space', rule: [['g', 'Kp 3 or less'], ['y', 'Kp 4'], ['r', 'Kp 5+ storm (blinks)']]}},
+            temp: {{name: 'Temperature', rule: [['g', '{TEMP_GREEN_RANGE[0]:g}–{TEMP_GREEN_RANGE[1]:g}°C'], ['y', '{TEMP_YELLOW_RANGE[0]:g}–{TEMP_GREEN_RANGE[0]:g} or {TEMP_GREEN_RANGE[1]:g}–{TEMP_YELLOW_RANGE[1]:g}°C'], ['r', 'below {TEMP_YELLOW_RANGE[0]:g} or above {TEMP_YELLOW_RANGE[1]:g}°C']]}},
+            rain: {{name: 'Rain', rule: [['g', 'dry next {RAIN_YELLOW_MINUTES // 60} h'], ['y', 'rain within {RAIN_YELLOW_MINUTES // 60} h'], ['r', 'raining or within {RAIN_RED_MINUTES} min']]}},
+            s_bahn: {{name: 'S-Bahn', rule: [['g', '13+ min'], ['y', '10–12 min (blinks at 9)'], ['r', 'under 9 min']]}},
+            stau: {{name: 'Stau', rule: [['g', 'delay under 20%'], ['y', '20–45%'], ['r', '45%+']]}},
+            emergency: {{name: 'Blinking', rule: [['y', 'blinks every {EMERGENCY_BLINK_INTERVAL:g} s']]}},
+            sos: {{name: 'SOS', rule: [['a', 'Morse SOS on all lamps']]}},
+            party: {{name: 'Music', rule: [['a', 'a random lamp on every beat · dark in silence']]}},
+            audio_vu: {{name: 'VU meter', rule: [['g', 'quiet'], ['y', 'loud (green + yellow)'], ['r', 'very loud (all)']]}},
+        }};
+        const GROUP_OF = {{}};
+        Object.entries(GROUPS).forEach(([g, d]) => d.modes.forEach(m => GROUP_OF[m] = g));
+        let lastSub = {{}};
+        try {{ lastSub = JSON.parse(localStorage.getItem('tl_lastSub') || '{{}}'); }} catch (e) {{}}
+        function rememberSub(mode) {{
+            const g = GROUP_OF[mode];
+            if (!g || GROUPS[g].modes.length < 2 || lastSub[g] === mode) return;
+            lastSub[g] = mode;
+            try {{ localStorage.setItem('tl_lastSub', JSON.stringify(lastSub)); }} catch (e) {{}}
+        }}
+        function renderGroups(mode) {{
+            Object.entries(GROUPS).forEach(([g, d]) => {{
+                const tile = document.getElementById(`group-${{g}}`);
+                tile.classList.toggle('active', GROUP_OF[mode] === g);
+                if (d.modes.length > 1) document.getElementById(`groupSub-${{g}}`).textContent = SUBS[lastSub[g] || d.modes[0]].name;
+            }});
+            const g = GROUP_OF[mode], subs = document.getElementById('subs');
+            if (!g || GROUPS[g].modes.length < 2) {{ subs.hidden = true; return; }}
+            subs.hidden = false;
+            document.getElementById('chips').innerHTML = GROUPS[g].modes.map(m =>
+                `<button type="button" class="chip${{m === mode ? ' active' : ''}}" onclick="selectSub('${{m}}')">${{SUBS[m].name}}</button>`).join('');
+            const dot = {{r: '#ff2b2b', y: '#ffcb2e', g: '#2bd672'}};
+            document.getElementById('rule').innerHTML = SUBS[mode].rule.map(([c, txt]) =>
+                `<span><b style="background:${{c === 'a' ? 'linear-gradient(#ff2b2b,#ffcb2e,#2bd672)' : dot[c]}}"></b>${{txt}}</span>`).join('');
+        }}
+        function modeTitle(mode) {{
+            if (mode === 'idle') return 'OFF';
+            const g = GROUP_OF[mode];
+            if (!g) return mode.replace('_', ' ').toUpperCase();
+            const name = GROUPS[g].name.toUpperCase();
+            return GROUPS[g].modes.length > 1 ? `${{name}} <em>· ${{SUBS[mode].name}}</em>` : name;
+        }}
         const LED_SEGMENTS = Array.from({{length: 10}}, () => {{
             const seg = document.createElement('div');
             seg.className = 'led-seg';
@@ -1476,7 +1718,7 @@ _HTML = f"""
             if (color === 'green') return '#00ff00';
             return null;
         }}
-        function computeBarPct(mode, s_bahn_minutes, space_weather, traffic, party, environment, iracing_rev_pct) {{
+        function computeBarPct(mode, s_bahn_minutes, space_weather, traffic, party, environment, iracing_rev_pct, audio_level) {{
             if (mode === 'racing') {{
                 if (iracing_rev_pct === undefined || iracing_rev_pct === null) return null;
                 return Math.max(0, Math.min(1, iracing_rev_pct / 100));
@@ -1493,6 +1735,13 @@ _HTML = f"""
                 const v = (traffic || {{}}).avg_delay;
                 return (v === undefined || v === null) ? 1 : Math.max(0, Math.min(1, v / 60));
             }}
+            if (mode === 'audio_vu') {{
+                return Math.max(0, Math.min(1, audio_level || 0));
+            }}
+            if (mode === 'temp') {{
+                const v = (environment || {{}}).temp;
+                return (typeof v === 'number') ? Math.max(0, Math.min(1, (v + 5) / 40)) : 1;
+            }}
             if (mode === 'party') {{
                 const v = (party || {{}}).level;
                 return (typeof v === 'number') ? Math.max(0, Math.min(1, v)) : null;
@@ -1503,9 +1752,9 @@ _HTML = f"""
             }}
             return null;
         }}
-        function updateBar(color, mode, s_bahn_minutes, space_weather, traffic, party, environment, iracing_rev_pct) {{
+        function updateBar(color, mode, s_bahn_minutes, space_weather, traffic, party, environment, iracing_rev_pct, audio_level) {{
             const ledStrip = document.getElementById('ledStrip');
-            const pct = computeBarPct(mode, s_bahn_minutes, space_weather, traffic, party, environment, iracing_rev_pct);
+            const pct = computeBarPct(mode, s_bahn_minutes, space_weather, traffic, party, environment, iracing_rev_pct, audio_level);
             if (pct === null) {{
                 ledStrip.classList.remove('visible');
                 return;
@@ -1513,7 +1762,7 @@ _HTML = f"""
             ledStrip.classList.add('visible');
             // In racing mode the bar tracks rev_pct continuously even while the main
             // lights are still black (below the first shift point) - fall back to green.
-            const hex = barHexForColor(color) || (mode === 'racing' || mode === 'party' ? '#00ff00' : null);
+            const hex = barHexForColor(color) || (mode === 'racing' || mode === 'party' || mode === 'audio_vu' ? '#00ff00' : null);
             const raw = hex ? pct * LED_SEGMENTS.length : 0;
             const fullLit = Math.floor(raw);
             const frac = raw - fullLit;
@@ -1525,18 +1774,14 @@ _HTML = f"""
                 seg.style.opacity = lit ? (0.35 + 0.65 * level) : 1;
             }});
         }}
-        function updateVisuals(color, mode, s_bahn_minutes, weather, race_step, space_weather, traffic, party, s_bahn_transit, environment, gremio, iracing_rev_pct) {{
-            updateBar(color, mode, s_bahn_minutes, space_weather, traffic, party, environment, iracing_rev_pct);
+        function updateVisuals(color, mode, s_bahn_minutes, weather, race_step, space_weather, traffic, party, s_bahn_transit, environment, gremio, iracing_rev_pct, audio_level) {{
+            updateBar(color, mode, s_bahn_minutes, space_weather, traffic, party, environment, iracing_rev_pct, audio_level);
             if (currentModeFromServer !== mode) {{
-                const currentActive = document.querySelector('.mode-buttons a.active');
-                if (currentActive) currentActive.classList.remove('active');
-                if (mode !== 'idle' && mode !== 'manual') {{
-                    const newActive = document.getElementById(`mode-${{mode}}`);
-                    if (newActive) newActive.classList.add('active');
-                }}
+                rememberSub(mode);
+                renderGroups(mode);
+                document.querySelector('#modeText strong').innerHTML = modeTitle(mode);
             }}
             currentModeFromServer = mode;
-            document.querySelector('#modeText strong').textContent = (mode === 'idle') ? 'OFF' : mode.replace('_', ' ').toUpperCase();
             const infoDisplay = document.getElementById('info-display');
             if (mode === 's_bahn') {{
                 let base;
@@ -1597,6 +1842,30 @@ _HTML = f"""
                     parts.push(e.is_day ? 'Day' : 'Night');
                 }}
                 infoDisplay.textContent = parts.join(' · ');
+            }}
+            else if (mode === 'audio_vu') {{
+                infoDisplay.textContent = `Audio level: ${{Math.round(Math.min(Math.max(audio_level || 0, 0), 1) * 100)}}%`;
+            }}
+            else if (mode === 'temp') {{
+                const e = environment || {{}};
+                if (typeof e.temp !== 'number') infoDisplay.textContent = 'No temperature data.';
+                else {{
+                    const parts = [`${{Math.round(e.temp)}}°C now`];
+                    if (typeof e.feels_like === 'number') parts.push(`feels ${{Math.round(e.feels_like)}}°C`);
+                    if (typeof e.temp_max === 'number') parts.push(`high ${{Math.round(e.temp_max)}}°C`);
+                    infoDisplay.textContent = parts.join(' · ');
+                }}
+            }}
+            else if (mode === 'rain') {{
+                const e = environment || {{}};
+                if (e.rain_now === undefined) infoDisplay.textContent = 'No forecast data.';
+                else if (e.rain_now) infoDisplay.textContent = 'Raining now.';
+                else if (typeof e.rain_eta_min === 'number') {{
+                    const m = e.rain_eta_min;
+                    const when = m < 60 ? `${{Math.max(m, 5)}} min` : `${{(m / 60).toFixed(m < 120 ? 1 : 0)}} h`;
+                    infoDisplay.textContent = `Rain likely in ~${{when}} (${{e.rain_prob_max}}%).`;
+                }}
+                else infoDisplay.textContent = `Dry for the next {RAIN_YELLOW_MINUTES // 60} h (max ${{e.rain_prob_max || 0}}%).`;
             }}
             else if (mode === 'clock') {{
                 const d = new Date();
@@ -1701,6 +1970,15 @@ _HTML = f"""
             stopLocalAnimation(); fetch(`/?action=set_mode&mode=${{mode}}`);
             if (!isTogglingOff && mode === 'sos') startSosAnimation();
         }}
+        function handleGroupClick(g) {{
+            // Tapping the active group turns it off (the Pi toggles a mode set twice);
+            // otherwise start the sub-mode used last.
+            const mode = GROUP_OF[currentModeFromServer] === g ? currentModeFromServer : (lastSub[g] || GROUPS[g].modes[0]);
+            handleModeClick(mode);
+        }}
+        function selectSub(mode) {{
+            if (mode !== currentModeFromServer) handleModeClick(mode);
+        }}
         function setConnected(ok) {{
             const pill = document.getElementById('connPill');
             const label = document.getElementById('connLabel');
@@ -1709,7 +1987,7 @@ _HTML = f"""
         }}
         function applyStatus(status) {{
             if (localAnimationId) return;
-            updateVisuals(status.color, status.mode, status.s_bahn_minutes, status.weather, status.race_step, status.space_weather, status.traffic, status.party, status.s_bahn_transit, status.environment, status.gremio, status.iracing_rev_pct);
+            updateVisuals(status.color, status.mode, status.s_bahn_minutes, status.weather, status.race_step, status.space_weather, status.traffic, status.party, status.s_bahn_transit, status.environment, status.gremio, status.iracing_rev_pct, status.audio_level);
         }}
         let eventSource = null;
         function connectEvents() {{
@@ -1805,6 +2083,9 @@ class TrafficLightController:
             'uv': handle_uv_mode,
             'gremio': handle_gremio_mode,
             'clock': handle_clock_mode,
+            'audio_vu': handle_audio_vu_mode,
+            'temp': handle_temp_mode,
+            'rain': handle_rain_mode,
         }
     def _init_hardware(self, use_mock_hardware: bool) -> LightHardware:
         if use_mock_hardware:
@@ -1842,8 +2123,13 @@ class TrafficLightController:
             prev = self.state.current_color
             try:
                 self.hardware.set_state(color); self.state.current_color = color
-                # The relay click is audible to the mic; Party masks it out.
-                self.state.mode_state['click_until'] = time() + PARTY_CLICK_MASK_SECONDS
+                # The relay click is audible to the mic; Party masks it out,
+                # the VU meter ignores the mic until it has rung out.
+                now = time()
+                self.state.mode_state['click_until'] = now + PARTY_CLICK_MASK_SECONDS
+                if self.state.current_mode == 'audio_vu':
+                    self.state.mode_state['audio_vu_last_step_time'] = now
+                    self.state.mode_state['audio_vu_ignore_until'] = now + AUDIO_VU_RELAY_IGNORE_SECONDS
                 logging.info(f"Light: {prev} -> {color}")
             except Exception as e:
                 logging.error(f"Failed to set light {color}: {e}")
@@ -1909,6 +2195,11 @@ class TrafficLightController:
             self.set_light_state(self.state.mode_state['sos_pattern'][0]['state'])
         elif new_mode == 'racing':
             self.state.mode_state['race_step'] = 0; self.set_light_state('off')
+        elif new_mode == 'audio_vu':
+            now = time(); ms = self.state.mode_state
+            self.set_light_state('off'); self.state.audio_vu_level = 0.0
+            ms.update(audio_vu_last=now, audio_vu_ignore_until=now + AUDIO_VU_RELAY_IGNORE_SECONDS,
+                      audio_vu_last_step_time=now, audio_vu_floor=AUDIO_VU_FLOOR_SEED, audio_vu_last_update=0.0)
         elif new_mode == 'party':
             self.state.party_status = {}
             for k in ('party_last_beat', 'party_last_switch'): self.state.mode_state[k] = 0.0
