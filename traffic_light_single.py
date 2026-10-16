@@ -233,6 +233,7 @@ class SharedState:
     iracing_light_status: str = "black"
     iracing_rev_pct: Optional[float] = None
     iracing_delta: Optional[float] = None
+    iracing_flag_status: str = "black"
     iracing_lap_invalid: bool = False
     iracing_last_rx: float = 0.0
     space_weather_status: Dict = field(default_factory=dict)
@@ -278,6 +279,7 @@ class SharedState:
             'iracing_rev_pct': self.iracing_rev_pct,
             'iracing_delta': self.iracing_delta,
             'iracing_lap_invalid': self.iracing_lap_invalid,
+            'iracing_flag': self.iracing_flag_status,
             'iracing_live': time() - self.iracing_last_rx < HOTLAP_STALE_SECONDS,
             'space_weather': self.space_weather_status.copy(),
             'traffic': self.traffic_status.copy(),
@@ -391,6 +393,15 @@ def handle_racing_mode(controller, elapsed: float) -> Optional[float]:
         elif step == 3 and elapsed > RACING_STEP_DURATION: controller.set_light_state('off'); s.mode_state['race_step'] += 1; s.last_state_change_time = time()
     else:
         live = s.iracing_light_status if s.iracing_light_status != 'black' else 'off'; controller.set_light_state(live); return 0.05
+
+def handle_race_start_mode(controller, elapsed: float) -> Optional[float]:
+    # Race start lights and flags from the plugin: red = lights set, yellow = get ready / yellow flag, green = go.
+    s = controller.state
+    if time() - s.iracing_last_rx > HOTLAP_STALE_SECONDS:
+        controller.set_light_state('off'); return 0.1
+    flag = s.iracing_flag_status
+    controller.set_light_state('off' if flag == 'black' else flag)
+    return 0.02
 
 def handle_hotlap_mode(controller, elapsed: float) -> Optional[float]:
     s = controller.state; now = time(); c = s.current_color
@@ -1583,10 +1594,11 @@ def iracing_udp_listener(controller):
                 try:
                     data, _ = sock.recvfrom(1024)
                     payload = data.decode('utf-8').strip()
-                    # Wire format is "<color>[:<revpct>[:<delta>:<invalid>]]"; the
-                    # extra fields are optional so older senders keep working.
+                    # Wire format is "<rev_color>[:<revpct>[:<delta>:<invalid>[:<flag_color>]]]";
+                    # the extra fields are optional so older senders keep working.
                     # delta = seconds vs your best lap (empty = no reference yet),
-                    # invalid = 1 once the current lap is invalidated.
+                    # invalid = 1 once the current lap is invalidated,
+                    # flag_color = race start lights / flags (old senders put flags in the first field).
                     fields = payload.split(':')
                     color = fields[0]
                     if color in valid:
@@ -1601,6 +1613,7 @@ def iracing_udp_listener(controller):
                             controller.state.iracing_rev_pct = num(1, 0.0, 100.0)
                             controller.state.iracing_delta = num(2)
                             controller.state.iracing_lap_invalid = len(fields) > 3 and fields[3] == '1'
+                            controller.state.iracing_flag_status = fields[4] if len(fields) > 4 and fields[4] in valid else color
                             controller.state.iracing_last_rx = time()
                 except socket.timeout: continue
                 except Exception: continue
@@ -1693,7 +1706,7 @@ _HTML = f"""
             commute: {{name: 'Commute', modes: ['s_bahn', 'stau']}},
             alerts: {{name: 'Alerts', modes: ['emergency', 'sos']}},
             party: {{name: 'Party', modes: ['party', 'audio_vu']}},
-            racing: {{name: 'Racing', modes: ['racing', 'hotlap']}},
+            racing: {{name: 'Racing', modes: ['race_start', 'racing', 'hotlap']}},
             gremio: {{name: 'Grêmio', modes: ['gremio']}},
             clock: {{name: 'Clock', modes: ['clock']}},
         }};
@@ -1709,6 +1722,7 @@ _HTML = f"""
             emergency: {{name: 'Blinking', rule: [['y', 'blinks every {EMERGENCY_BLINK_INTERVAL:g} s']]}},
             sos: {{name: 'SOS', rule: [['a', 'Morse SOS on all lamps']]}},
             racing: {{name: 'Revs', rule: [['g', 'shift light'], ['y', 'shift now (green + yellow)'], ['r', 'redline (all)']]}},
+            race_start: {{name: 'Start', rule: [['r', 'start lights on'], ['y', 'get ready or yellow flag'], ['g', 'go or green flag']]}},
             hotlap: {{name: 'Hotlap', rule: [['g', 'faster than your best lap'], ['y', 'slower'], ['r', 'lap invalid']]}},
             party: {{name: 'Music', rule: [['a', 'random lamp on every beat'], ['a', 'dark in silence']]}},
             audio_vu: {{name: 'VU meter', rule: [['g', 'quiet'], ['y', 'loud (green + yellow)'], ['r', 'very loud (all)']]}},
@@ -1856,6 +1870,10 @@ _HTML = f"""
             else if (mode === 'biergarten') {{
                 if (weather && weather.temp && weather.condition) {{ infoDisplay.textContent = `${{weather.temp.toFixed(1)}}°C, ${{weather.condition}}`; }}
                 else {{ infoDisplay.textContent = 'No weather data.'; }}
+            }}
+            else if (mode === 'race_start') {{
+                const names = {{red: 'Start lights on', yellow: 'Get ready / yellow flag', green: 'Go! / green flag', black: 'No start or flag right now'}};
+                infoDisplay.textContent = lastStatus.iracing_live ? (names[lastStatus.iracing_flag] || '') : 'Listening for iRacing...';
             }}
             else if (mode === 'hotlap') {{
                 const d = lastStatus.iracing_delta;
@@ -2141,6 +2159,7 @@ class TrafficLightController:
             'biergarten': handle_biergarten_mode,
             'racing': handle_racing_mode,
             'hotlap': handle_hotlap_mode,
+            'race_start': handle_race_start_mode,
             'space': handle_space_mode,
             'stau': handle_stau_mode,
             'uv': handle_uv_mode,
@@ -2258,7 +2277,7 @@ class TrafficLightController:
             self.set_light_state(self.state.mode_state['sos_pattern'][0]['state'])
         elif new_mode == 'racing':
             self.state.mode_state['race_step'] = 0; self.set_light_state('off')
-        elif new_mode == 'hotlap':
+        elif new_mode in ('hotlap', 'race_start'):
             self.set_light_state('off')
         elif new_mode == 'audio_vu':
             now = time(); ms = self.state.mode_state

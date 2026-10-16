@@ -13,10 +13,9 @@ namespace SimHub.Plugins.TrafficLight
     {
         public string UdpIpAddress { get; set; } = "127.0.0.1";
         public int UdpPort { get; set; } = 12345;
-        public bool UseRevLights { get; set; } = false; // Setting for the new toggle
     }
 
-    [PluginDescription("Sends game flag or rev light status via UDP.")]
+    [PluginDescription("Sends rev lights, race start/flags and hotlap delta to the traffic light via UDP.")]
     [PluginAuthor("You")]
     [PluginName("Traffic Light Plugin (Flags & Revs)")]
     public class TrafficLightPlugin : IPlugin, IDataPlugin, IWPFSettings
@@ -25,6 +24,8 @@ namespace SimHub.Plugins.TrafficLight
         private SettingsControl _settingsControl;
 
         private bool _initSequenceComplete = false;
+        private readonly UdpClient _udp = new UdpClient();
+        private DateTime _lastStatusUpdate = DateTime.MinValue;
 
         // Hotlap: the current lap stays invalid from the first infraction until the next lap starts.
         private int _lapNumber = -1;
@@ -56,80 +57,59 @@ namespace SimHub.Plugins.TrafficLight
         {
             if (!_initSequenceComplete || !data.GameRunning || data.NewData == null) return;
 
-            string currentState = "black"; // Default state
-
-            // Same RPM values that drive the shift light thresholds below
+            // Everything is sent on every tick; the traffic light's Racing sub-mode picks what to show.
             double currentRpms = GetPropertyDoubleSafe(pluginManager, "DataCorePlugin.GameData.Rpms");
-            double redlineRpms = GetPropertyDoubleSafe(pluginManager, "DataCorePlugin.GameData.CarSettings_RPMRedLineReached");
-            double shift2Rpms = GetPropertyDoubleSafe(pluginManager, "DataCorePlugin.GameData.CarSettings_RPMShiftLight2");
-            double shift1Rpms = GetPropertyDoubleSafe(pluginManager, "DataCorePlugin.GameData.CarSettings_RPMShiftLight1");
-
             // CarSettings_RPMRedLineReached only populates once redline is actually hit (0 otherwise), so it
             // can't serve as a stable percentage denominator - CarSettings_RedLineRPM is the constant threshold.
             double stableRedlineRpms = GetPropertyDoubleSafe(pluginManager, "DataCorePlugin.GameData.CarSettings_RedLineRPM");
             double revPct = stableRedlineRpms > 0 ? Math.Max(0, Math.Min(100, currentRpms / stableRedlineRpms * 100)) : 0;
-
-            // --- Check if the Rev Light mode is enabled ---
-            if (Settings.UseRevLights)
-            {
-                string diagnosticStatus = $"Mode: Revs | RPM:{Math.Round(currentRpms)} R:{redlineRpms} Y:{shift2Rpms} G:{shift1Rpms}";
-                _settingsControl?.Dispatcher.Invoke(() => _settingsControl.UpdateStatus(diagnosticStatus));
-
-                if (redlineRpms > 0 && currentRpms >= redlineRpms) { currentState = "red"; }
-                else if (shift2Rpms > 0 && currentRpms >= shift2Rpms) { currentState = "yellow"; }
-                else if (shift1Rpms > 0 && currentRpms >= shift1Rpms) { currentState = "green"; }
-            }
-            else
-            {
-                // --- Flag and Race Start Logic ---
-                bool isRaceStartSequenceActive = false;
-                if (data.GameName == "IRacing")
-                {
-                    if (Convert.ToBoolean(pluginManager.GetPropertyValue("DataCorePlugin.GameRawData.Telemetry.SessionFlagsDetails.IsstartGo"))) { currentState = "green"; isRaceStartSequenceActive = true; }
-                    else if (Convert.ToBoolean(pluginManager.GetPropertyValue("DataCorePlugin.GameRawData.Telemetry.SessionFlagsDetails.IsstartSet")) || Convert.ToBoolean(pluginManager.GetPropertyValue("DataCorePlugin.GameRawData.Telemetry.SessionFlagsDetails.Isfurled"))) { currentState = "red"; isRaceStartSequenceActive = true; }
-                    else if (Convert.ToBoolean(pluginManager.GetPropertyValue("DataCorePlugin.GameRawData.SessionData.WeekendInfo.WeekendOptions.StandingStart")) && Convert.ToBoolean(pluginManager.GetPropertyValue("DataCorePlugin.GameRawData.Telemetry.SessionFlagsDetails.IsstartReady"))) { currentState = "yellow"; isRaceStartSequenceActive = true; }
-                }
-                if (!isRaceStartSequenceActive)
-                {
-                    if (data.NewData.Flag_Yellow > 0) { currentState = "yellow"; }
-                    else if (data.NewData.Flag_Green > 0) { currentState = "green"; }
-                }
-                _settingsControl?.Dispatcher.Invoke(() => _settingsControl.UpdateStatus($"Mode: Flags | Current State: {currentState}"));
-            }
-
-            // --- New Progressive Logic for Rev Lights ---
-            string messageToSend;
-            if (Settings.UseRevLights)
-            {
-                messageToSend = "black"; // Default to turning lights off
-                if (currentState == "green")
-                {
-                    messageToSend = "green";
-                }
-                else if (currentState == "yellow")
-                {
-                    messageToSend = "green-yellow";
-                }
-                else if (currentState == "red")
-                {
-                    messageToSend = "all_on";
-                }
-            }
-            else // For flags, just send the single state
-            {
-                messageToSend = currentState;
-            }
-
-            // Hotlap fields: live delta to your best lap (empty = no reference yet) and whether this lap is invalid.
+            string revState = ReadRevState(pluginManager, currentRpms);
+            string flagState = ReadFlagState(pluginManager, data);
             double? delta = ReadLapDelta(pluginManager, data);
             bool lapInvalid = UpdateLapInvalid(pluginManager, data);
             string deltaText = delta.HasValue ? delta.Value.ToString("0.000", CultureInfo.InvariantCulture) : "";
-            _settingsControl?.Dispatcher.Invoke(() => _settingsControl.AppendHotlapStatus(
-                delta.HasValue ? $"Delta: {deltaText} s | Lap {(lapInvalid ? "INVALID" : "valid")}" : $"Delta: no reference lap | Lap {(lapInvalid ? "INVALID" : "valid")}"));
 
-            // Sent every tick (not just on state change) so the rev_pct bar never freezes on a stale value.
-            // Format: <state>:<rev_pct>:<delta>:<invalid>
-            SendUdpMessage($"{messageToSend}:{revPct.ToString("0.#", CultureInfo.InvariantCulture)}:{deltaText}:{(lapInvalid ? 1 : 0)}");
+            // Format: <rev_state>:<rev_pct>:<delta>:<invalid>:<flag_state>
+            // Sent every tick (not just on change) so the rev bar and delta never freeze on a stale value.
+            SendUdpMessage($"{revState}:{revPct.ToString("0.#", CultureInfo.InvariantCulture)}:{deltaText}:{(lapInvalid ? 1 : 0)}:{flagState}");
+
+            // The settings page only needs a few refreshes a second.
+            if (_settingsControl != null && (DateTime.UtcNow - _lastStatusUpdate).TotalMilliseconds > 250)
+            {
+                _lastStatusUpdate = DateTime.UtcNow;
+                string status = $"Revs: {revState} ({Math.Round(revPct)}%)\n" +
+                                $"Start/flags: {flagState}\n" +
+                                (delta.HasValue ? $"Delta: {deltaText} s" : "Delta: no reference lap") + $" | Lap {(lapInvalid ? "INVALID" : "valid")}";
+                _settingsControl.Dispatcher.BeginInvoke(new Action(() => _settingsControl.UpdateStatus(status)));
+            }
+        }
+
+        // Shift lights: green, then green + yellow, then all three at redline.
+        private string ReadRevState(PluginManager pluginManager, double currentRpms)
+        {
+            double redlineRpms = GetPropertyDoubleSafe(pluginManager, "DataCorePlugin.GameData.CarSettings_RPMRedLineReached");
+            double shift2Rpms = GetPropertyDoubleSafe(pluginManager, "DataCorePlugin.GameData.CarSettings_RPMShiftLight2");
+            double shift1Rpms = GetPropertyDoubleSafe(pluginManager, "DataCorePlugin.GameData.CarSettings_RPMShiftLight1");
+            if (redlineRpms > 0 && currentRpms >= redlineRpms) return "all_on";
+            if (shift2Rpms > 0 && currentRpms >= shift2Rpms) return "green-yellow";
+            if (shift1Rpms > 0 && currentRpms >= shift1Rpms) return "green";
+            return "black";
+        }
+
+        // Race start lights (iRacing), otherwise the yellow/green flag.
+        private string ReadFlagState(PluginManager pluginManager, GameData data)
+        {
+            if (data.GameName == "IRacing")
+            {
+                const string flags = "DataCorePlugin.GameRawData.Telemetry.SessionFlagsDetails.";
+                if (GetPropertyBoolSafe(pluginManager, flags + "IsstartGo")) return "green";
+                if (GetPropertyBoolSafe(pluginManager, flags + "IsstartSet") || GetPropertyBoolSafe(pluginManager, flags + "Isfurled")) return "red";
+                if (GetPropertyBoolSafe(pluginManager, "DataCorePlugin.GameRawData.SessionData.WeekendInfo.WeekendOptions.StandingStart")
+                    && GetPropertyBoolSafe(pluginManager, flags + "IsstartReady")) return "yellow";
+            }
+            if (data.NewData.Flag_Yellow > 0) return "yellow";
+            if (data.NewData.Flag_Green > 0) return "green";
+            return "black";
         }
 
         private double? ReadLapDelta(PluginManager pluginManager, GameData data)
@@ -178,19 +158,6 @@ namespace SimHub.Plugins.TrafficLight
             return _lapInvalid;
         }
 
-        private bool GetPropertyBoolSafe(PluginManager pluginManager, string propertyName)
-        {
-            try
-            {
-                object value = pluginManager.GetPropertyValue(propertyName);
-                return value != null && Convert.ToBoolean(value);
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
         private double GetPropertyDoubleSafe(PluginManager pluginManager, string propertyName)
         {
             try
@@ -204,27 +171,38 @@ namespace SimHub.Plugins.TrafficLight
             }
         }
 
+        private bool GetPropertyBoolSafe(PluginManager pluginManager, string propertyName)
+        {
+            try
+            {
+                object value = pluginManager.GetPropertyValue(propertyName);
+                return value != null && Convert.ToBoolean(value);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         public void SendUdpMessage(string message)
         {
             try
             {
-                using (var client = new UdpClient())
-                {
-                    byte[] dataBytes = Encoding.UTF8.GetBytes(message);
-                    client.Send(dataBytes, dataBytes.Length, Settings.UdpIpAddress, Settings.UdpPort);
-                    SimHub.Logging.Current.Info($"Traffic Light Plugin: Sent UDP packet: {message}");
-                }
+                // One socket for the plugin's lifetime; sending ~60 packets a second, a new client per packet adds up.
+                byte[] dataBytes = Encoding.UTF8.GetBytes(message);
+                _udp.Send(dataBytes, dataBytes.Length, Settings.UdpIpAddress, Settings.UdpPort);
             }
             catch (Exception ex)
             {
                 SimHub.Logging.Current.Error($"Traffic Light Plugin: Failed to send UDP packet. {ex.Message}");
-                _settingsControl?.Dispatcher.Invoke(() => _settingsControl.UpdateStatus($"Error: {ex.Message}"));
+                _settingsControl?.Dispatcher.BeginInvoke(new Action(() => _settingsControl.UpdateStatus($"Error: {ex.Message}")));
             }
         }
 
         public void End(PluginManager pluginManager)
         {
             this.SaveCommonSettings("TrafficLightPluginSettings", Settings);
+            _udp.Close();
         }
 
         public Control GetWPFSettingsControl(PluginManager pluginManager)
