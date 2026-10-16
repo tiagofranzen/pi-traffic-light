@@ -48,7 +48,8 @@ from the chips under the light, which also show what each colour means.
 | | Stau | How bad your commute is right now | TomTom or Google Maps key |
 | Party | Music | Hops to a random lamp on every beat. Music without a clear beat hops on the loudest hits; silence stays dark | a USB mic |
 | | VU meter | Mic level: green, then green + yellow, then all three | a USB mic |
-| Racing | | Live flags + rev bar from iRacing, via [`simhub-plugin/`](simhub-plugin) | the plugin, UDP → port 9001 |
+| Racing | Revs | Shift lights + rev bar (or flags) from iRacing, via [`simhub-plugin/`](simhub-plugin) | the plugin, UDP → port 9001 |
+| | Hotlap | Live delta to your best lap: green while faster, yellow while slower, red as soon as the lap is invalid (off track, black flag, meatball) | the plugin |
 | Grêmio | | Last match result |, (ESPN) |
 | Alerts | Blinking | Blinking yellow |, |
 | | SOS | Morse SOS, for when it's actually that bad |, |

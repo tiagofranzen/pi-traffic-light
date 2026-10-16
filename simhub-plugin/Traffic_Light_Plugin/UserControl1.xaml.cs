@@ -48,5 +48,13 @@ namespace SimHub.Plugins.TrafficLight
         {
             StatusTextBlock.Text = message;
         }
+
+        /// <summary>
+        /// Adds the hotlap line (delta and lap validity) under the current status.
+        /// </summary>
+        public void AppendHotlapStatus(string message)
+        {
+            StatusTextBlock.Text = StatusTextBlock.Text.Split('\n')[0] + "\n" + message;
+        }
     }
 }
