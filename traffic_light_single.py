@@ -2,7 +2,7 @@
 """Single-file Traffic Light Control System (fully consolidated).
 
 Includes: configuration, shared state, hardware abstraction (real/mock),
-mode handlers, monitors (S-Bahn, weather, space, traffic, iRacing UDP),
+mode handlers, monitors (S-Bahn, weather, space, traffic, SimHub UDP),
 web server, controller class, and main entry point.
 
 Run: python3 traffic_light/traffic_light_single.py
@@ -42,8 +42,8 @@ ACTIVE_HIGH = False
 # Network
 WEB_SERVER_HOST = "0.0.0.0"
 WEB_SERVER_PORT = 8000
-IRACING_UDP_HOST = "0.0.0.0"
-IRACING_UDP_PORT = 9001
+SIMHUB_UDP_HOST = "0.0.0.0"
+SIMHUB_UDP_PORT = 9001
 
 # Timing (seconds)
 AUTO_GREEN_DURATION = 20.0
@@ -241,12 +241,12 @@ class SharedState:
     s_bahn_minutes_away: int = -1
     s_bahn_transit_status: Dict = field(default_factory=dict)
     weather_status: Dict = field(default_factory=dict)
-    iracing_light_status: str = "black"
-    iracing_rev_pct: Optional[float] = None
-    iracing_delta: Optional[float] = None
-    iracing_flag_status: str = "black"
-    iracing_lap_invalid: bool = False
-    iracing_last_rx: float = 0.0
+    simhub_light_status: str = "black"
+    simhub_rev_pct: Optional[float] = None
+    simhub_delta: Optional[float] = None
+    simhub_flag_status: str = "black"
+    simhub_lap_invalid: bool = False
+    simhub_last_rx: float = 0.0
     space_weather_status: Dict = field(default_factory=dict)
     traffic_status: Dict = field(default_factory=dict)
     environment_status: Dict = field(default_factory=dict)
@@ -286,11 +286,11 @@ class SharedState:
             's_bahn_transit': self.s_bahn_transit_status.copy(),
             'weather': self.weather_status.copy(),
             'race_step': 0 if self.mode_state.get('intro_seq') else 4,  # the web UI waits for the intro to finish
-            'iracing_rev_pct': self.iracing_rev_pct,
-            'iracing_delta': self.iracing_delta,
-            'iracing_lap_invalid': self.iracing_lap_invalid,
-            'iracing_flag': self.iracing_flag_status,
-            'iracing_live': time() - self.iracing_last_rx < HOTLAP_STALE_SECONDS,
+            'simhub_rev_pct': self.simhub_rev_pct,
+            'simhub_delta': self.simhub_delta,
+            'simhub_lap_invalid': self.simhub_lap_invalid,
+            'simhub_flag': self.simhub_flag_status,
+            'simhub_live': time() - self.simhub_last_rx < HOTLAP_STALE_SECONDS,
             'space_weather': self.space_weather_status.copy(),
             'traffic': self.traffic_status.copy(),
             'environment': self.environment_status.copy(),
@@ -416,7 +416,7 @@ def handle_racing_mode(controller, elapsed: float) -> Optional[float]:
     if intro is not None:
         return intro
     s = controller.state
-    live = s.iracing_light_status if s.iracing_light_status != 'black' else 'off'; controller.set_light_state(live); return 0.05
+    live = s.simhub_light_status if s.simhub_light_status != 'black' else 'off'; controller.set_light_state(live); return 0.05
 
 def handle_race_start_mode(controller, elapsed: float) -> Optional[float]:
     # Race start lights and flags from the plugin: red = lights set, yellow = get ready / yellow flag, green = go.
@@ -424,9 +424,9 @@ def handle_race_start_mode(controller, elapsed: float) -> Optional[float]:
     if intro is not None:
         return intro
     s = controller.state
-    if time() - s.iracing_last_rx > HOTLAP_STALE_SECONDS:
+    if time() - s.simhub_last_rx > HOTLAP_STALE_SECONDS:
         controller.set_light_state('off'); return 0.1
-    flag = s.iracing_flag_status
+    flag = s.simhub_flag_status
     controller.set_light_state('off' if flag == 'black' else flag)
     return 0.02
 
@@ -435,11 +435,11 @@ def handle_hotlap_mode(controller, elapsed: float) -> Optional[float]:
     if intro is not None:
         return intro
     s = controller.state; now = time(); c = s.current_color
-    if now - s.iracing_last_rx > HOTLAP_STALE_SECONDS:
+    if now - s.simhub_last_rx > HOTLAP_STALE_SECONDS:
         controller.set_light_state('off'); return 0.1
-    if s.iracing_lap_invalid:
+    if s.simhub_lap_invalid:
         controller.set_light_state('red'); return 0.02  # overrides the delta, immediately
-    d = s.iracing_delta
+    d = s.simhub_delta
     if d is None:
         controller.set_light_state('off'); return 0.05  # no reference lap yet
     if d < -HOTLAP_DEADBAND: want = 'green'
@@ -1593,7 +1593,7 @@ def audio_monitor(controller):
         with controller.state.lock:
             controller.state.party_status = {}
 
-# iRacing UDP
+# SimHub UDP
 
 def network_monitor(controller):
     prev: Optional[bool] = None
@@ -1615,11 +1615,11 @@ def network_monitor(controller):
                 prev = connected
         sleep(NETWORK_POLL_INTERVAL)
 
-def iracing_udp_listener(controller):
+def simhub_udp_listener(controller):
     valid = {'red','yellow','green','black','green-yellow','all_on'}
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.bind((IRACING_UDP_HOST, IRACING_UDP_PORT)); sock.settimeout(1.0)
+            sock.bind((SIMHUB_UDP_HOST, SIMHUB_UDP_PORT)); sock.settimeout(1.0)
             while controller.state.running:
                 try:
                     data, _ = sock.recvfrom(1024)
@@ -1639,16 +1639,16 @@ def iracing_udp_listener(controller):
                                 return None
                             return v if lo is None else max(lo, min(hi, v))
                         with controller.state.lock:
-                            controller.state.iracing_light_status = color
-                            controller.state.iracing_rev_pct = num(1, 0.0, 100.0)
-                            controller.state.iracing_delta = num(2)
-                            controller.state.iracing_lap_invalid = len(fields) > 3 and fields[3] == '1'
-                            controller.state.iracing_flag_status = fields[4] if len(fields) > 4 and fields[4] in valid else color
-                            controller.state.iracing_last_rx = time()
+                            controller.state.simhub_light_status = color
+                            controller.state.simhub_rev_pct = num(1, 0.0, 100.0)
+                            controller.state.simhub_delta = num(2)
+                            controller.state.simhub_lap_invalid = len(fields) > 3 and fields[3] == '1'
+                            controller.state.simhub_flag_status = fields[4] if len(fields) > 4 and fields[4] in valid else color
+                            controller.state.simhub_last_rx = time()
                 except socket.timeout: continue
                 except Exception: continue
     except Exception as e:
-        logging.error(f"iRacing listener error: {e}")
+        logging.error(f"SimHub listener error: {e}")
 
 # --------------------------- Web Server ------------------------------------
 _HTML = f"""
@@ -1818,10 +1818,10 @@ _HTML = f"""
             if (color === 'green') return '#00ff00';
             return null;
         }}
-        function computeBarPct(mode, s_bahn_minutes, space_weather, traffic, party, environment, iracing_rev_pct, audio_level) {{
+        function computeBarPct(mode, s_bahn_minutes, space_weather, traffic, party, environment, simhub_rev_pct, audio_level) {{
             if (mode === 'racing') {{
-                if (iracing_rev_pct === undefined || iracing_rev_pct === null) return null;
-                return Math.max(0, Math.min(1, iracing_rev_pct / 100));
+                if (simhub_rev_pct === undefined || simhub_rev_pct === null) return null;
+                return Math.max(0, Math.min(1, simhub_rev_pct / 100));
             }}
             if (mode === 'uv') {{
                 const v = (environment || {{}}).uv_index;
@@ -1839,8 +1839,8 @@ _HTML = f"""
                 return Math.max(0, Math.min(1, audio_level || 0));
             }}
             if (mode === 'hotlap') {{
-                const d = lastStatus.iracing_delta;
-                return (lastStatus.iracing_live && typeof d === 'number' && !lastStatus.iracing_lap_invalid) ? Math.min(1, Math.abs(d)) : null;
+                const d = lastStatus.simhub_delta;
+                return (lastStatus.simhub_live && typeof d === 'number' && !lastStatus.simhub_lap_invalid) ? Math.min(1, Math.abs(d)) : null;
             }}
             if (mode === 'temp') {{
                 const v = (environment || {{}}).temp;
@@ -1856,9 +1856,9 @@ _HTML = f"""
             }}
             return null;
         }}
-        function updateBar(color, mode, s_bahn_minutes, space_weather, traffic, party, environment, iracing_rev_pct, audio_level) {{
+        function updateBar(color, mode, s_bahn_minutes, space_weather, traffic, party, environment, simhub_rev_pct, audio_level) {{
             const ledStrip = document.getElementById('ledStrip');
-            const pct = computeBarPct(mode, s_bahn_minutes, space_weather, traffic, party, environment, iracing_rev_pct, audio_level);
+            const pct = computeBarPct(mode, s_bahn_minutes, space_weather, traffic, party, environment, simhub_rev_pct, audio_level);
             if (pct === null) {{
                 ledStrip.classList.remove('visible');
                 return;
@@ -1878,8 +1878,8 @@ _HTML = f"""
                 seg.style.opacity = lit ? (0.35 + 0.65 * level) : 1;
             }});
         }}
-        function updateVisuals(color, mode, s_bahn_minutes, weather, race_step, space_weather, traffic, party, s_bahn_transit, environment, gremio, iracing_rev_pct, audio_level) {{
-            updateBar(color, mode, s_bahn_minutes, space_weather, traffic, party, environment, iracing_rev_pct, audio_level);
+        function updateVisuals(color, mode, s_bahn_minutes, weather, race_step, space_weather, traffic, party, s_bahn_transit, environment, gremio, simhub_rev_pct, audio_level) {{
+            updateBar(color, mode, s_bahn_minutes, space_weather, traffic, party, environment, simhub_rev_pct, audio_level);
             if (currentModeFromServer !== mode) {{
                 rememberSub(mode);
                 renderGroups(mode);
@@ -1903,17 +1903,17 @@ _HTML = f"""
             }}
             else if (mode === 'race_start') {{
                 const names = {{red: 'Start lights on', yellow: 'Get ready / yellow flag', green: 'Go! / green flag', black: 'No start or flag right now'}};
-                infoDisplay.textContent = lastStatus.iracing_live ? (names[lastStatus.iracing_flag] || '') : 'Listening for iRacing...';
+                infoDisplay.textContent = lastStatus.simhub_live ? (names[lastStatus.simhub_flag] || '') : 'Waiting for SimHub…';
             }}
             else if (mode === 'hotlap') {{
-                const d = lastStatus.iracing_delta;
-                if (!lastStatus.iracing_live) infoDisplay.textContent = 'Listening for iRacing...';
-                else if (lastStatus.iracing_lap_invalid) infoDisplay.textContent = 'Lap invalid. Next lap counts again.';
+                const d = lastStatus.simhub_delta;
+                if (!lastStatus.simhub_live) infoDisplay.textContent = 'Waiting for SimHub…';
+                else if (lastStatus.simhub_lap_invalid) infoDisplay.textContent = 'Lap invalid. Next lap counts again.';
                 else if (typeof d !== 'number') infoDisplay.textContent = 'Set a lap first: no reference yet.';
                 else infoDisplay.textContent = `${{d < 0 ? '−' : '+'}}${{Math.abs(d).toFixed(2)}} s vs your best lap`;
             }}
             else if (mode === 'racing' && race_step >= 4) {{
-                infoDisplay.textContent = (typeof iracing_rev_pct === 'number') ? `Revs: ${{Math.round(iracing_rev_pct)}}%` : 'Listening for iRacing...';
+                infoDisplay.textContent = (typeof simhub_rev_pct === 'number') ? `Revs: ${{Math.round(simhub_rev_pct)}}%` : 'Waiting for SimHub…';
             }}
             else if (mode === 'space') {{
                 if (space_weather && space_weather.kp_index !== undefined) {{ infoDisplay.textContent = `Kp-index: ${{space_weather.kp_index}} (${{space_weather.condition}})`; }}
@@ -2097,7 +2097,7 @@ _HTML = f"""
         function applyStatus(status) {{
             lastStatus = status;
             if (localAnimationId) return;
-            updateVisuals(status.color, status.mode, status.s_bahn_minutes, status.weather, status.race_step, status.space_weather, status.traffic, status.party, status.s_bahn_transit, status.environment, status.gremio, status.iracing_rev_pct, status.audio_level);
+            updateVisuals(status.color, status.mode, status.s_bahn_minutes, status.weather, status.race_step, status.space_weather, status.traffic, status.party, status.s_bahn_transit, status.environment, status.gremio, status.simhub_rev_pct, status.audio_level);
         }}
         let eventSource = null;
         function connectEvents() {{
@@ -2372,7 +2372,7 @@ def main():
         threading.Thread(target=weather_monitor, args=(ctrl,), name='weather', daemon=True),
         threading.Thread(target=space_weather_monitor, args=(ctrl,), name='space', daemon=True),
         threading.Thread(target=traffic_monitor, args=(ctrl,), name='traffic', daemon=True),
-        threading.Thread(target=iracing_udp_listener, args=(ctrl,), name='iracing', daemon=True),
+        threading.Thread(target=simhub_udp_listener, args=(ctrl,), name='simhub', daemon=True),
         threading.Thread(target=audio_monitor, args=(ctrl,), name='audio', daemon=True),
         threading.Thread(target=network_monitor, args=(ctrl,), name='network', daemon=True),
         threading.Thread(target=transit_monitor, args=(ctrl,), name='transit', daemon=True),

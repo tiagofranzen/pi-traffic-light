@@ -25,9 +25,10 @@ yellow, or green in the end.
   because even a novelty desktop light deserves not to murder your
   phone's battery.
 - One Python file. No framework, no build step, no npm anywhere near this.
-- A SimHub plugin lives in [`simhub-plugin/`](simhub-plugin) so iRacing
-  can yell at the lights directly, flags, or a live shift-light rev bar,
-  over UDP.
+- A SimHub plugin lives in [`simhub-plugin/`](simhub-plugin) so any game
+  SimHub reads (iRacing, AC EVO, ACC, LMU, ...) can yell at the lights
+  directly, start lights and flags, a live shift-light rev bar, or your
+  hotlap delta, over UDP.
 
 ## Modes
 
@@ -50,7 +51,7 @@ from the chips under the light, which also show what each colour means.
 | | VU meter | Mic level: green, then green + yellow, then all three | a USB mic |
 | Racing | Start | Race start lights (red set, yellow ready, green go) and yellow/green flags, via [`simhub-plugin/`](simhub-plugin) | the plugin, UDP → port 9001 |
 | | Revs | Shift lights + rev bar | the plugin |
-| | Hotlap | Live delta to your best lap: green while faster, yellow while slower, red as soon as the lap is invalid (off track, black flag, meatball) | the plugin |
+| | Hotlap | Live delta to your best lap: green while faster, yellow while slower, red as soon as the game says the lap is invalid (track limits, penalties) | the plugin |
 | Grêmio | | Last match result |, (ESPN) |
 | Alerts | Blinking | Blinking yellow |, |
 | | SOS | Morse SOS, for when it's actually that bad |, |
@@ -96,9 +97,9 @@ Stau and the commute).
 Framework 4.8, C#, Visual Studio). Open
 `simhub-plugin/Traffic_Light_Plugin.sln`, build it, restart SimHub,
 enable "Traffic Light Plugin (Flags & Revs)" in the plugins list, point
-it at your Pi's IP and port `9001`. Pick flag mode or rev-light mode in
-the settings panel and go find out how far past redline you actually
-are.
+it at your Pi's IP and port `9001`. Works with whatever game SimHub is
+reading; pick Start, Revs or Hotlap on the light and go find out how far
+past redline you actually are.
 
 ## API
 
