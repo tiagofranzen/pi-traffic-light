@@ -83,8 +83,12 @@ want to pretend it's a real app.
 Optional environment variables, only needed for the modes that ask for a
 key above: `DB_CLIENT_ID` / `DB_CLIENT_SECRET`, `OWM_API_KEY`,
 `TOMTOM_API_KEY` (or `GOOGLE_MAPS_API_KEY` as a fallback),
-`AUDIO_INPUT_DEVICE`, and `COMMUTE_ORIGIN` / `COMMUTE_DESTINATION`
-(your home and work addresses, for the Stau commute route).
+`AUDIO_INPUT_DEVICE`. Where you are lives in the environment too, never
+in the code: `WEATHER_LAT` / `WEATHER_LON` (defaults to Munich centre),
+`S_BAHN_EVA` (your station's EVA number) and `S_BAHN_SKIP_DESTINATIONS`
+(comma-separated end stations of trains going the wrong way), and
+`COMMUTE_ORIGIN` / `COMMUTE_DESTINATION` (home and work addresses, for
+Stau and the commute).
 
 ## Running the SimHub side
 

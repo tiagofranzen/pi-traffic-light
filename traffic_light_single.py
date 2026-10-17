@@ -180,25 +180,25 @@ CLOCK_STRIKE_ON = 0.75             # how long each hour strike stays lit
 CLOCK_STRIKE_INTERVAL = 1.5        # strike to strike
 CLOCK_QUIET_HOURS = (23, 7)        # no chimes from 23:00 to 06:59 (relays click)
 
-# Location / routes
-WEATHER_LAT = "48.137"
-WEATHER_LON = "11.575"
-S_BAHN_EVA = "STATION_EVA"  # HOME_STATION
-OUTBOUND_DESTINATIONS: Tuple[str, ...] = (
-    "STATION_A","STATION_B"
+# Location / routes - everything that says where you live or work comes from
+# the environment so it stays out of the repo.
+WEATHER_LAT = os.getenv("WEATHER_LAT", "48.137").strip()   # default: Munich centre
+WEATHER_LON = os.getenv("WEATHER_LON", "11.575").strip()
+S_BAHN_EVA = os.getenv("S_BAHN_EVA", "").strip()  # your station's EVA number; S-Bahn mode is off without it
+# Trains ending at these stations (comma-separated) go the wrong way and are ignored.
+OUTBOUND_DESTINATIONS: Tuple[str, ...] = tuple(
+    d.strip() for d in os.getenv("S_BAHN_SKIP_DESTINATIONS", "").split(",") if d.strip()
 )
-# Public-transport commute uses the same home -> workplace addresses as the
-# 'commute' entry in TRAFFIC_ROUTES (see below). Addresses are geocoded via
-# TomTom and passed to MVG (Munich transit authority, free, no key).
-# The home and work addresses come from the environment so they stay out of the
-# repo; without them the commute route is skipped.
+# Home -> work, for Stau and the public-transport commute; addresses are
+# geocoded via TomTom and passed to MVG (Munich transit authority, free, no
+# key). Without a home address there are no routes.
 MVG_ROUTES_URL = "https://www.mvg.de/api/bgw-pt/v3/routes"
 COMMUTE_ORIGIN = os.getenv("COMMUTE_ORIGIN", "").strip()
 COMMUTE_DESTINATION = os.getenv("COMMUTE_DESTINATION", "").strip()
 TRAFFIC_ROUTES: Tuple[dict, ...] = (
     *([{"name": "commute","origin": COMMUTE_ORIGIN,"destination": COMMUTE_DESTINATION}] if COMMUTE_ORIGIN and COMMUTE_DESTINATION else []),
-    {"name": "center","origin": "HOME_TOWN, Germany","destination": "Marienplatz, Munich, Germany"},
-    {"name": "north","origin": "HOME_TOWN, Germany","destination": "BMW Welt, Munich, Germany"},
+    *([{"name": "center","origin": COMMUTE_ORIGIN,"destination": "Marienplatz, Munich, Germany"},
+       {"name": "north","origin": COMMUTE_ORIGIN,"destination": "BMW Welt, Munich, Germany"}] if COMMUTE_ORIGIN else []),
 )
 
 # API keys (env)
@@ -725,8 +725,8 @@ def _get_next_train_minutes() -> Optional[int]:
     return min(upcoming) if upcoming else None
 
 def s_bahn_monitor(controller):
-    if not (DB_CLIENT_ID and DB_CLIENT_SECRET):
-        logging.warning("S-Bahn disabled: credentials missing")
+    if not (DB_CLIENT_ID and DB_CLIENT_SECRET and S_BAHN_EVA):
+        logging.warning("S-Bahn disabled: credentials or S_BAHN_EVA missing")
         return
     while controller.state.running:
         mins = _get_next_train_minutes()
