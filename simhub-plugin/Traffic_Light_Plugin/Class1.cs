@@ -27,7 +27,7 @@ namespace SimHub.Plugins.TrafficLight
         private readonly UdpClient _udp = new UdpClient();
         private DateTime _lastStatusUpdate = DateTime.MinValue;
 
-        // Hotlap: the current lap stays invalid from the first infraction until the next lap starts.
+        // Hotlap (iRacing): the current lap stays invalid from the first infraction until the next lap starts.
         private int _lapNumber = -1;
         private bool _lapInvalid = false;
 
@@ -79,7 +79,8 @@ namespace SimHub.Plugins.TrafficLight
                 _lastStatusUpdate = DateTime.UtcNow;
                 string status = $"Revs: {revState} ({Math.Round(revPct)}%)\n" +
                                 $"Start/flags: {flagState}\n" +
-                                (delta.HasValue ? $"Delta: {deltaText} s" : "Delta: no reference lap") + $" | Lap {(lapInvalid ? "INVALID" : "valid")}";
+                                (delta.HasValue ? $"Delta: {deltaText} s" : "Delta: no reference lap") + $" | Lap {(lapInvalid ? "INVALID" : "valid")}" +
+                                $"\nGame: {data.GameName} | lap {data.NewData.CurrentLap} @ {data.NewData.CurrentLapTime.TotalSeconds:0.0} s | game says valid: {data.NewData.IsLapValid}";
                 _settingsControl.Dispatcher.BeginInvoke(new Action(() => _settingsControl.UpdateStatus(status)));
             }
         }
@@ -127,8 +128,12 @@ namespace SimHub.Plugins.TrafficLight
 
         private bool UpdateLapInvalid(PluginManager pluginManager, GameData data)
         {
-            bool iRacing = data.GameName == "IRacing";
-            int lap = iRacing ? (int)GetPropertyDoubleSafe(pluginManager, "DataCorePlugin.GameRawData.Telemetry.Lap") : data.NewData.CurrentLap;
+            // Other games keep their own per-lap validity flag until the line, so use it live. Latching it here
+            // (or using SimHub's latched LapInvalidated) re-arms on the stale "invalid" the game still reports for
+            // a tick or two after the line, which kept the whole next lap red (seen in AC EVO).
+            if (data.GameName != "IRacing") return !data.NewData.IsLapValid;
+
+            int lap = (int)GetPropertyDoubleSafe(pluginManager, "DataCorePlugin.GameRawData.Telemetry.Lap");
             if (lap != _lapNumber)
             {
                 _lapNumber = lap;
@@ -136,22 +141,19 @@ namespace SimHub.Plugins.TrafficLight
             }
 
             bool infraction = data.NewData.LapInvalidated;
-            if (iRacing)
+            // Track limits: the player's car is off the racing surface.
+            int carIdx = (int)GetPropertyDoubleSafe(pluginManager, "DataCorePlugin.GameRawData.SessionData.DriverInfo.DriverCarIdx");
+            if (pluginManager.GetPropertyValue("DataCorePlugin.GameRawData.Telemetry.CarIdxTrackSurface") is Array surfaces
+                && carIdx >= 0 && carIdx < surfaces.Length
+                && Convert.ToString(surfaces.GetValue(carIdx)) == "OffTrack")
             {
-                // Track limits: the player's car is off the racing surface.
-                int carIdx = (int)GetPropertyDoubleSafe(pluginManager, "DataCorePlugin.GameRawData.SessionData.DriverInfo.DriverCarIdx");
-                if (pluginManager.GetPropertyValue("DataCorePlugin.GameRawData.Telemetry.CarIdxTrackSurface") is Array surfaces
-                    && carIdx >= 0 && carIdx < surfaces.Length
-                    && Convert.ToString(surfaces.GetValue(carIdx)) == "OffTrack")
-                {
+                infraction = true;
+            }
+            // Penalties: black flag, black flag warning, meatball (repair) or disqualification.
+            foreach (string flag in new[] { "Isblack", "Isfurled", "Isrepair", "Isdisqualify" })
+            {
+                if (GetPropertyBoolSafe(pluginManager, "DataCorePlugin.GameRawData.Telemetry.SessionFlagsDetails." + flag))
                     infraction = true;
-                }
-                // Penalties: black flag, black flag warning, meatball (repair) or disqualification.
-                foreach (string flag in new[] { "Isblack", "Isfurled", "Isrepair", "Isdisqualify" })
-                {
-                    if (GetPropertyBoolSafe(pluginManager, "DataCorePlugin.GameRawData.Telemetry.SessionFlagsDetails." + flag))
-                        infraction = true;
-                }
             }
 
             if (infraction) _lapInvalid = true;
