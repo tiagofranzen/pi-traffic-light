@@ -190,9 +190,13 @@ OUTBOUND_DESTINATIONS: Tuple[str, ...] = (
 # Public-transport commute uses the same home -> workplace addresses as the
 # 'commute' entry in TRAFFIC_ROUTES (see below). Addresses are geocoded via
 # TomTom and passed to MVG (Munich transit authority, free, no key).
+# The home and work addresses come from the environment so they stay out of the
+# repo; without them the commute route is skipped.
 MVG_ROUTES_URL = "https://www.mvg.de/api/bgw-pt/v3/routes"
+COMMUTE_ORIGIN = os.getenv("COMMUTE_ORIGIN", "").strip()
+COMMUTE_DESTINATION = os.getenv("COMMUTE_DESTINATION", "").strip()
 TRAFFIC_ROUTES: Tuple[dict, ...] = (
-    {"name": "commute","origin": "HOME_STREET, HOME_ZIP HOME_TOWN, Germany","destination": "WORK_STREET, WORK_ZIP München, Germany"},
+    *([{"name": "commute","origin": COMMUTE_ORIGIN,"destination": COMMUTE_DESTINATION}] if COMMUTE_ORIGIN and COMMUTE_DESTINATION else []),
     {"name": "center","origin": "HOME_TOWN, Germany","destination": "Marienplatz, Munich, Germany"},
     {"name": "north","origin": "HOME_TOWN, Germany","destination": "BMW Welt, Munich, Germany"},
 )

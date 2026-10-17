@@ -83,7 +83,8 @@ want to pretend it's a real app.
 Optional environment variables, only needed for the modes that ask for a
 key above: `DB_CLIENT_ID` / `DB_CLIENT_SECRET`, `OWM_API_KEY`,
 `TOMTOM_API_KEY` (or `GOOGLE_MAPS_API_KEY` as a fallback),
-`AUDIO_INPUT_DEVICE`.
+`AUDIO_INPUT_DEVICE`, and `COMMUTE_ORIGIN` / `COMMUTE_DESTINATION`
+(your home and work addresses, for the Stau commute route).
 
 ## Running the SimHub side
 
