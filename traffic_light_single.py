@@ -22,7 +22,6 @@ from typing import Dict, Optional, Protocol, List, Tuple
 from datetime import datetime, timedelta
 import random
 import socket
-import fcntl
 import struct
 import ipaddress
 import json
@@ -52,6 +51,7 @@ AUTO_RED_DURATION = 20.0
 AUTO_RED_YELLOW_DURATION = 2.0
 EMERGENCY_BLINK_INTERVAL = 0.5
 CONTROLLER_LOOP_SLEEP = 0.2
+SSE_KEEPALIVE_SECONDS = 15.0
 # Intro played when a Racing sub-mode is selected: (lamps, seconds) steps.
 # One rev to the limiter: quick climb, hold on redline, drop back, short breath.
 _REV_BLIP = [('green', 0.1), ('green-yellow', 0.1), ('all_on', 0.6), ('green-yellow', 0.12), ('green', 0.12), ('off', 0.35)]
@@ -63,17 +63,23 @@ RACING_INTROS = {
 # Hotlap (Racing sub-mode): live delta to your best lap from the SimHub plugin.
 HOTLAP_DEADBAND = 0.03       # +-s around 0 where the colour holds, so being exactly on pace doesn't chatter the relays
 HOTLAP_MIN_SWITCH = 0.25     # s between green/yellow changes (red always switches at once)
-HOTLAP_STALE_SECONDS = 2.0   # no packet from the plugin for this long -> lights off
+SIMHUB_STALE_SECONDS = 2.0   # no packet from the plugin for this long (game closed) -> Racing lights off
 S_BAHN_POLL_INTERVAL = 30.0
+S_BAHN_STALE_SECONDS = 300.0   # keep counting down from the last timetable this long when fetches fail
 WEATHER_POLL_INTERVAL = 900.0
 SPACE_POLL_INTERVAL = 900.0
 TRAFFIC_POLL_INTERVAL = 600.0
 NETWORK_POLL_INTERVAL = 10.0
+LAST_MODE_FILE = os.path.expanduser(os.getenv("LAST_MODE_FILE", "~/.traffic_light_mode.json"))
 TRANSIT_POLL_INTERVAL = 600.0
 ENVIRONMENT_POLL_INTERVAL = 600.0   # also feeds Temperature and Rain, so keep it fresh
 GREMIO_POLL_INTERVAL = 3600.0
 API_TIMEOUT = 15.0
+POLL_RETRY_SECONDS = 30.0      # first retry after a failed fetch; doubles up to the poll interval
+POLL_STALE_INTERVALS = 3       # keep the last good data this many poll intervals before showing "no data"
 AUDIO_INPUT_DEVICE = os.getenv("AUDIO_INPUT_DEVICE", "").strip()
+AUDIO_RETRY_SECONDS = 5.0       # mic missing or failed: look again after this, doubling...
+AUDIO_RETRY_MAX_SECONDS = 60.0  # ...up to this
 
 # Party mode - beat-synced light show driven by the USB mic.
 # Pipeline (all numpy, runs in the audio thread only while Party is active):
@@ -204,13 +210,11 @@ TRAFFIC_ROUTES: Tuple[dict, ...] = (
 # API keys (env)
 DB_CLIENT_ID = os.getenv("DB_CLIENT_ID", "")
 DB_CLIENT_SECRET = os.getenv("DB_CLIENT_SECRET", "")
-OWM_API_KEY = os.getenv("OWM_API_KEY", "")
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
 TOMTOM_API_KEY = os.getenv("TOMTOM_API_KEY", "")
 
 # API URLs
-DB_API_URL = "https://apis.deutschebahn.com/db-api-marketplace/apis/timetables/v1/plan"
-WEATHER_API_URL_TEMPLATE = "https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={api_key}&units=metric"
+DB_API_URL = "https://apis.deutschebahn.com/db-api-marketplace/apis/timetables/v1"
 SPACE_WEATHER_URL = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json"
 GOOGLE_DIRECTIONS_URL = "https://maps.googleapis.com/maps/api/directions/json"
 TOMTOM_GEOCODE_URL = "https://api.tomtom.com/search/2/geocode/{query}.json"
@@ -223,9 +227,6 @@ GREMIO_ESPN_LEAGUES = ["bra.1", "bra.copa_do_brazil", "conmebol.libertadores", "
 
 def _gremio_schedule_url(league: str) -> str:
     return f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/teams/{GREMIO_ESPN_TEAM_ID}/schedule"
-
-def _gremio_scoreboard_url(league: str) -> str:
-    return f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/scoreboard"
 
 # In-process geocode cache for TomTom (address -> (lat, lon))
 _TOMTOM_GEOCODE_CACHE: Dict[str, Tuple[float, float]] = {}
@@ -240,7 +241,6 @@ class SharedState:
     last_state_change_time: float = field(default_factory=time)
     s_bahn_minutes_away: int = -1
     s_bahn_transit_status: Dict = field(default_factory=dict)
-    weather_status: Dict = field(default_factory=dict)
     simhub_light_status: str = "black"
     simhub_rev_pct: Optional[float] = None
     simhub_delta: Optional[float] = None
@@ -254,6 +254,9 @@ class SharedState:
     party_status: Dict = field(default_factory=dict)
     audio_vu_level: float = 0.0
     network_connected: bool = False
+    # What was last picked in the UI: restored when the network comes back and after a restart.
+    chosen_mode: str = 'manual'
+    chosen_color: str = 'off'
     mode_state: Dict = field(default_factory=lambda: {
         'next_auto_state': 'green',
         'sos_index': 0,
@@ -284,13 +287,12 @@ class SharedState:
             'mode': self.current_mode,
             's_bahn_minutes': self.s_bahn_minutes_away,
             's_bahn_transit': self.s_bahn_transit_status.copy(),
-            'weather': self.weather_status.copy(),
             'race_step': 0 if self.mode_state.get('intro_seq') else 4,  # the web UI waits for the intro to finish
             'simhub_rev_pct': self.simhub_rev_pct,
             'simhub_delta': self.simhub_delta,
             'simhub_lap_invalid': self.simhub_lap_invalid,
             'simhub_flag': self.simhub_flag_status,
-            'simhub_live': time() - self.simhub_last_rx < HOTLAP_STALE_SECONDS,
+            'simhub_live': time() - self.simhub_last_rx < SIMHUB_STALE_SECONDS,
             'space_weather': self.space_weather_status.copy(),
             'traffic': self.traffic_status.copy(),
             'environment': self.environment_status.copy(),
@@ -301,6 +303,8 @@ class SharedState:
         }
 
 # --------------------------- Hardware --------------------------------------
+LIGHT_STATES = ('off', 'red', 'yellow', 'green', 'red_and_yellow', 'green-yellow', 'all_on')
+
 class LEDInterface(Protocol):
     def on(self) -> None: ...
     def off(self) -> None: ...
@@ -350,11 +354,10 @@ class LightHardware:
     def test_sequence(self, duration: float = 0.15) -> None:
         for l in self.all_lights: l.on(); sleep(duration); l.off()
     def cleanup(self) -> None:
-        try:
-            import RPi.GPIO as GPIO
-            self.all_off(); GPIO.cleanup()
-        except Exception:
-            pass
+        # The pins belong to gpiozero, so it releases them (RPi.GPIO doesn't know them, and doesn't work on a Pi 5).
+        for led in self.all_lights:
+            try: led.off(); led.close()
+            except Exception: pass
 
 # --------------------------- Mode Handlers ---------------------------------
 # Each returns optional custom sleep value.
@@ -388,10 +391,10 @@ def handle_s_bahn_mode(controller, elapsed: float) -> Optional[float]:
     else: controller.set_light_state('green')
 
 def handle_biergarten_mode(controller, elapsed: float) -> Optional[float]:
-    w = controller.state.weather_status; temp = w.get('temp'); cond = w.get('condition'); hour = datetime.now().hour; c = controller.state.current_color
+    w = controller.state.environment_status; temp = w.get('temp'); cond = w.get('condition'); hour = datetime.now().hour; c = controller.state.current_color
     if temp is None or cond is None: controller.set_light_state('red' if c != 'red' else 'off'); return 0.5
-    elif hour < 16 or temp < 15 or 'Rain' in cond or 'Snow' in cond: controller.set_light_state('red')
-    elif temp < 18 or 'Clouds' in cond: controller.set_light_state('yellow')
+    elif hour < 16 or temp < 15 or cond in ('Drizzle', 'Rain', 'Snow', 'Thunderstorm'): controller.set_light_state('red')
+    elif temp < 18 or cond in ('Clouds', 'Fog'): controller.set_light_state('yellow')
     else: controller.set_light_state('green')
 
 def _play_intro(controller) -> Optional[float]:
@@ -416,6 +419,8 @@ def handle_racing_mode(controller, elapsed: float) -> Optional[float]:
     if intro is not None:
         return intro
     s = controller.state
+    if time() - s.simhub_last_rx > SIMHUB_STALE_SECONDS:
+        controller.set_light_state('off'); return 0.1  # the plugin stops sending when the game closes
     live = s.simhub_light_status if s.simhub_light_status != 'black' else 'off'; controller.set_light_state(live); return 0.05
 
 def handle_race_start_mode(controller, elapsed: float) -> Optional[float]:
@@ -424,7 +429,7 @@ def handle_race_start_mode(controller, elapsed: float) -> Optional[float]:
     if intro is not None:
         return intro
     s = controller.state
-    if time() - s.simhub_last_rx > HOTLAP_STALE_SECONDS:
+    if time() - s.simhub_last_rx > SIMHUB_STALE_SECONDS:
         controller.set_light_state('off'); return 0.1
     flag = s.simhub_flag_status
     controller.set_light_state('off' if flag == 'black' else flag)
@@ -435,7 +440,7 @@ def handle_hotlap_mode(controller, elapsed: float) -> Optional[float]:
     if intro is not None:
         return intro
     s = controller.state; now = time(); c = s.current_color
-    if now - s.simhub_last_rx > HOTLAP_STALE_SECONDS:
+    if now - s.simhub_last_rx > SIMHUB_STALE_SECONDS:
         controller.set_light_state('off'); return 0.1
     if s.simhub_lap_invalid:
         controller.set_light_state('red'); return 0.02  # overrides the delta, immediately
@@ -648,8 +653,38 @@ def handle_clock_mode(controller, elapsed: float) -> Optional[float]:
     return 0.2
 
 # --------------------------- Monitors --------------------------------------
+def _poll(controller, name: str, fetch, interval: float, store) -> None:
+    """Calls fetch() every interval and hands a good (non-empty) result to store() under the lock.
+    A failed fetch keeps the last good value and retries soon (30 s, doubling up to the
+    interval) - so a network hiccup, or Wi-Fi not being up yet at boot, doesn't blank a mode
+    for a whole interval. Only when the value is POLL_STALE_INTERVALS intervals old is it
+    dropped and the mode shows "no data"."""
+    last_ok = 0.0; retry = POLL_RETRY_SECONDS; cleared = True
+    while controller.state.running:
+        try:
+            value = fetch()
+        except Exception as e:
+            logging.warning(f"{name}: fetch failed: {e}"); value = None
+        now = time()
+        if value:
+            with controller.state.lock: store(value)
+            last_ok = now; retry = POLL_RETRY_SECONDS; cleared = False
+            wait = interval
+        else:
+            if not cleared and now - last_ok > interval * POLL_STALE_INTERVALS:
+                with controller.state.lock: store({})
+                cleared = True
+                logging.warning(f"{name}: no fresh data for {now - last_ok:.0f} s, dropped")
+            wait = min(retry, interval); retry = min(retry * 2, interval)
+            logging.info(f"{name}: no data, retrying in {wait:.0f} s")
+        sleep(wait)
+
 def _get_interface_ipv4(ifname: str) -> Optional[str]:
     """Return IPv4 address for an interface (Linux), or None."""
+    try:
+        import fcntl  # Linux only; elsewhere (UI work on a PC) there's no interface to ask
+    except ImportError:
+        return None
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         ifreq = struct.pack('256s', ifname.encode('utf-8')[:15])
@@ -694,44 +729,75 @@ def _is_network_connected() -> bool:
 
 # S-Bahn
 
-def _get_next_train_minutes() -> Optional[int]:
-    if not (DB_CLIENT_ID and DB_CLIENT_SECRET):
-        return None
+def _db_get(path: str) -> Optional[bytes]:
     headers = {"DB-Client-Id": DB_CLIENT_ID, "DB-Api-Key": DB_CLIENT_SECRET, "accept": "application/xml"}
-    now = datetime.now(); all_stops = []
-    for i in range(2):
-        t = now + timedelta(hours=i); date, hour = t.strftime('%y%m%d'), t.strftime('%H')
+    try:
+        r = requests.get(f"{DB_API_URL}/{path}", headers=headers, timeout=API_TIMEOUT)
+        r.raise_for_status()
+        return r.content
+    except Exception as e:
+        logging.debug(f"DB timetable {path} failed: {e}")
+        return None
+
+def _fetch_departures() -> Optional[List[datetime]]:
+    """Upcoming departures in our direction, with live times and without cancelled trains.
+    None if the timetable couldn't be fetched at all."""
+    now = datetime.now(); stops = []; got_plan = False
+    for i in range(2):  # this hour and the next
+        t = now + timedelta(hours=i)
+        content = _db_get(f"plan/{S_BAHN_EVA}/{t.strftime('%y%m%d')}/{t.strftime('%H')}")
+        if content is None:
+            continue  # keep the other hour
+        got_plan = True
+        if content:
+            try: stops.extend(ET.fromstring(content).findall('s'))
+            except ET.ParseError: pass
+    if not got_plan:
+        return None
+    # Live changes for the station: new departure time (ct) and cancellation (cs="c"), matched by stop id.
+    changes: Dict[str, ET.Element] = {}
+    content = _db_get(f"fchg/{S_BAHN_EVA}")
+    if content:
         try:
-            url = f"{DB_API_URL}/{S_BAHN_EVA}/{date}/{hour}"; r = requests.get(url, headers=headers, timeout=API_TIMEOUT)
-            r.raise_for_status();
-            if not r.content: continue
-            root = ET.fromstring(r.content); all_stops.extend(root.findall('s'))
-        except Exception:
-            return None
-    if not all_stops: return None
-    upcoming = []
-    for s in all_stops:
+            for s in ET.fromstring(content).findall('s'):
+                dp = s.find('dp')
+                if dp is not None and s.get('id'):
+                    changes[s.get('id')] = dp
+        except ET.ParseError:
+            pass
+    departures = []
+    for s in stops:
+        dp = s.find('.//dp')
+        if dp is None or not dp.get('ppth') or not dp.get('pt'):
+            continue
+        if dp.get('ppth').split('|')[-1] in OUTBOUND_DESTINATIONS:
+            continue
+        live = changes.get(s.get('id'))
+        if live is not None and live.get('cs') == 'c':
+            continue  # cancelled
         try:
-            dp = s.find('.//dp');
-            if dp is None: continue
-            path = dp.get('ppth'); raw = dp.get('pt')
-            if not path or not raw: continue
-            dest = path.split('|')[-1]
-            if dest in OUTBOUND_DESTINATIONS: continue
-            dt = datetime.strptime(raw, '%y%m%d%H%M')
-            if dt < now: continue
-            upcoming.append(int((dt - now).total_seconds()/60))
-        except Exception: continue
-    return min(upcoming) if upcoming else None
+            dt = datetime.strptime((live.get('ct') if live is not None and live.get('ct') else dp.get('pt')), '%y%m%d%H%M')
+        except ValueError:
+            continue
+        departures.append(dt)
+    return sorted(departures)
 
 def s_bahn_monitor(controller):
     if not (DB_CLIENT_ID and DB_CLIENT_SECRET and S_BAHN_EVA):
         logging.warning("S-Bahn disabled: credentials or S_BAHN_EVA missing")
         return
+    departures: List[datetime] = []; fetched_at = 0.0
     while controller.state.running:
-        mins = _get_next_train_minutes()
+        fresh = _fetch_departures()
+        if fresh is not None:
+            departures, fetched_at = fresh, time()
+        elif time() - fetched_at > S_BAHN_STALE_SECONDS:
+            departures = []  # too old to trust (cancellations, delays)
+        # Minutes from the stored times, so a failed fetch doesn't freeze or blank the countdown.
+        now = datetime.now()
+        upcoming = [int((d - now).total_seconds() / 60) for d in departures if d >= now]
         with controller.state.lock:
-            controller.state.s_bahn_minutes_away = mins if mins is not None else -1
+            controller.state.s_bahn_minutes_away = min(upcoming) if upcoming else -1
         sleep(S_BAHN_POLL_INTERVAL)
 
 # Public-transport commute (transport.rest - free DB HAFAS mirror, no API key)
@@ -791,31 +857,8 @@ def transit_monitor(controller):
     if not TOMTOM_API_KEY:
         logging.warning("Transit commute disabled: TOMTOM_API_KEY missing (used for geocoding)")
         return
-    while controller.state.running:
-        status = _fetch_transit_commute()
-        with controller.state.lock:
-            controller.state.s_bahn_transit_status = status
-        sleep(TRANSIT_POLL_INTERVAL)
-
-# Weather
-
-def _fetch_weather() -> Dict:
-    if not OWM_API_KEY: return {}
-    url = WEATHER_API_URL_TEMPLATE.format(lat=WEATHER_LAT, lon=WEATHER_LON, api_key=OWM_API_KEY)
-    try:
-        r = requests.get(url, timeout=API_TIMEOUT); r.raise_for_status(); data = r.json()
-        temp = data.get('main', {}).get('temp'); cond = data.get('weather', [{}])[0].get('main')
-        if temp is None or not cond: return {}
-        return {'temp': temp, 'condition': cond}
-    except Exception: return {}
-
-def weather_monitor(controller):
-    if not OWM_API_KEY: logging.warning("Weather disabled: OWM_API_KEY missing"); return
-    while controller.state.running:
-        status = _fetch_weather()
-        with controller.state.lock:
-            controller.state.weather_status = status
-        sleep(WEATHER_POLL_INTERVAL)
+    _poll(controller, 'Transit', _fetch_transit_commute, TRANSIT_POLL_INTERVAL,
+          lambda v: setattr(controller.state, 's_bahn_transit_status', v))
 
 # Space Weather
 
@@ -833,7 +876,7 @@ def _fetch_space() -> Dict:
             raw_kp = latest[1]
         if raw_kp is None:
             return {}
-        kp = int(float(raw_kp))
+        kp = int(round(float(raw_kp)))  # NOAA gives thirds (4.67 = "5-"); truncating under-reports storms
         cond = 'Storm' if kp >= 5 else ('Active' if kp == 4 else 'Quiet')
         return {'kp_index': kp, 'condition': cond}
     except Exception as e:
@@ -841,11 +884,8 @@ def _fetch_space() -> Dict:
         return {}
 
 def space_weather_monitor(controller):
-    while controller.state.running:
-        status = _fetch_space()
-        with controller.state.lock:
-            controller.state.space_weather_status = status
-        sleep(SPACE_POLL_INTERVAL)
+    _poll(controller, 'Space weather', _fetch_space, SPACE_POLL_INTERVAL,
+          lambda v: setattr(controller.state, 'space_weather_status', v))
 
 # Traffic
 
@@ -951,11 +991,8 @@ def traffic_monitor(controller):
     if not (TOMTOM_API_KEY or GOOGLE_MAPS_API_KEY):
         logging.warning("Traffic disabled: set TOMTOM_API_KEY (free) or GOOGLE_MAPS_API_KEY")
         return
-    while controller.state.running:
-        status = _fetch_traffic()
-        with controller.state.lock:
-            controller.state.traffic_status = status
-        sleep(TRAFFIC_POLL_INTERVAL)
+    _poll(controller, 'Traffic', _fetch_traffic, TRAFFIC_POLL_INTERVAL,
+          lambda v: setattr(controller.state, 'traffic_status', v))
 
 # Environment (UV, pollen, air quality, sun) via Open-Meteo (free, no key)
 
@@ -1000,6 +1037,16 @@ def _rain_outlook(current: Dict, hourly: Dict) -> Dict:
         'rain_prob_max': prob_max,
     }
 
+def _wmo_condition(code: int) -> str:
+    """Open-Meteo's WMO weather code as a one-word condition."""
+    if code <= 1: return 'Clear'
+    if code <= 3: return 'Clouds'
+    if code in (45, 48): return 'Fog'
+    if 51 <= code <= 57: return 'Drizzle'
+    if 71 <= code <= 77 or code in (85, 86): return 'Snow'
+    if code >= 95: return 'Thunderstorm'
+    return 'Rain'  # 61-67, 80-82
+
 def _fetch_environment() -> Dict:
     result: Dict = {}
     # Forecast: UV index + is_day + sunrise/sunset
@@ -1009,7 +1056,7 @@ def _fetch_environment() -> Dict:
             params={
                 'latitude': WEATHER_LAT,
                 'longitude': WEATHER_LON,
-                'current': 'uv_index,is_day,temperature_2m,apparent_temperature,precipitation',
+                'current': 'uv_index,is_day,temperature_2m,apparent_temperature,precipitation,weather_code',
                 'daily': 'sunrise,sunset,temperature_2m_max',
                 'hourly': 'precipitation,precipitation_probability',
                 'timezone': 'auto',
@@ -1036,6 +1083,8 @@ def _fetch_environment() -> Dict:
         for key, src in (('temp', 'temperature_2m'), ('feels_like', 'apparent_temperature')):
             if isinstance(cur.get(src), (int, float)):
                 result[key] = round(float(cur[src]), 1)
+        if isinstance(cur.get('weather_code'), (int, float)):
+            result['condition'] = _wmo_condition(int(cur['weather_code']))
         highs = daily.get('temperature_2m_max') or []
         if highs and isinstance(highs[0], (int, float)):
             result['temp_max'] = round(float(highs[0]), 1)
@@ -1090,11 +1139,10 @@ def _fetch_environment() -> Dict:
     return result
 
 def environment_monitor(controller):
-    while controller.state.running:
-        status = _fetch_environment()
-        with controller.state.lock:
-            controller.state.environment_status = status
-        sleep(ENVIRONMENT_POLL_INTERVAL)
+    # Forecast and air quality are separate requests; when only one comes back,
+    # merge it over the last values instead of losing the other half.
+    _poll(controller, 'Environment', _fetch_environment, ENVIRONMENT_POLL_INTERVAL,
+          lambda v: setattr(controller.state, 'environment_status', {**controller.state.environment_status, **v} if v else {}))
 
 # Grêmio last match result and next match via ESPN free API (no key required)
 
@@ -1107,15 +1155,16 @@ def _espn_competitor_score(competitor: Dict) -> int:
 def _fetch_gremio_last_result() -> Dict:
     out: Dict = {}
 
-    # Last completed match, across every tracked competition (each league's
-    # schedule returns events newest-first, so the first completed one per
-    # league is that league's latest - then keep whichever league is newest).
+    # Last completed match, across every tracked competition: newest completed
+    # event per league (sorted here rather than trusting ESPN's order), then the
+    # newest of those.
     best_ev, best_competitors = None, None
     for league in GREMIO_ESPN_LEAGUES:
         try:
             r = requests.get(_gremio_schedule_url(league), timeout=API_TIMEOUT)
             r.raise_for_status()
-            for ev in r.json().get('events') or []:
+            events = sorted(r.json().get('events') or [], key=lambda e: e.get('date') or '', reverse=True)
+            for ev in events:
                 comp = (ev.get('competitions') or [{}])[0]
                 if not (comp.get('status') or {}).get('type', {}).get('completed'):
                     continue
@@ -1131,38 +1180,36 @@ def _fetch_gremio_last_result() -> Dict:
         if gremio_c and opp_c:
             gs = _espn_competitor_score(gremio_c)
             os_ = _espn_competitor_score(opp_c)
+            # ESPN's winner flag also covers penalty shootouts, where the goals are level.
             if gremio_c.get('winner'):
                 match_result = 'win'
-            elif gs == os_:
-                match_result = 'draw'
-            else:
+            elif opp_c.get('winner') or gs < os_:
                 match_result = 'loss'
+            else:
+                match_result = 'draw'
             out.update({
                 'result': match_result,
                 'score': f"{gs}-{os_}",
                 'opponent': (opp_c.get('team') or {}).get('displayName', '?'),
                 'home_away': 'home' if gremio_c.get('homeAway') == 'home' else 'away',
-                'date': (best_ev.get('date') or '')[:10],
+                'date': best_ev.get('date') or '',
                 'competition': (best_ev.get('league') or {}).get('name'),
             })
 
-    # Next upcoming match, across every tracked competition (search 60 days ahead).
+    # Next upcoming match, across every tracked competition: each league's team
+    # fixtures (the scoreboard's date-range query answers 400).
     best_next, best_next_competitors = None, None
-    today = datetime.utcnow()
-    end_dt = today + timedelta(days=60)
-    date_range = f"{today.strftime('%Y%m%d')}-{end_dt.strftime('%Y%m%d')}"
     for league in GREMIO_ESPN_LEAGUES:
         try:
-            r = requests.get(_gremio_scoreboard_url(league), params={'dates': date_range}, timeout=API_TIMEOUT)
+            r = requests.get(_gremio_schedule_url(league), params={'fixture': 'true'}, timeout=API_TIMEOUT)
             r.raise_for_status()
-            for ev in r.json().get('events') or []:
+            events = sorted(r.json().get('events') or [], key=lambda e: e.get('date') or '')
+            for ev in events:
                 comp = (ev.get('competitions') or [{}])[0]
-                competitors = comp.get('competitors') or []
-                gremio_c = next((c for c in competitors if 'grêmio' in (c.get('team', {}).get('displayName') or '').lower()), None)
-                if not gremio_c:
-                    continue
+                if (comp.get('status') or {}).get('type', {}).get('state') != 'pre':
+                    continue  # already played, or under way
                 if best_next is None or (ev.get('date') or '') < (best_next.get('date') or ''):
-                    best_next, best_next_competitors = ev, competitors
+                    best_next, best_next_competitors = ev, comp.get('competitors') or []
                 break
         except Exception as e:
             logging.debug(f"Grêmio ESPN next match fetch failed ({league}): {e}")
@@ -1174,14 +1221,12 @@ def _fetch_gremio_last_result() -> Dict:
         out['next_match_opponent'] = (opp_c.get('team') or {}).get('displayName', '?') if opp_c else '?'
         out['next_match_home_away'] = 'home' if (gremio_c or {}).get('homeAway') == 'home' else 'away'
 
-    return out
+    # Without a last result the mode has nothing to show; count it as a failed fetch.
+    return out if 'result' in out else {}
 
 def gremio_monitor(controller):
-    while controller.state.running:
-        status = _fetch_gremio_last_result()
-        with controller.state.lock:
-            controller.state.gremio_status = status
-        sleep(GREMIO_POLL_INTERVAL)
+    _poll(controller, 'Grêmio', _fetch_gremio_last_result, GREMIO_POLL_INTERVAL,
+          lambda v: setattr(controller.state, 'gremio_status', v))
 
 class BeatTracker:
     """Live tempo/phase/energy estimate from mic blocks (see PARTY_* config)."""
@@ -1492,12 +1537,7 @@ def audio_monitor(controller):
 
         return None, None
 
-    device_index, device_name = _resolve_input_device()
-    if device_index is None:
-        logging.warning("Party audio disabled: no input-capable audio device found")
-        return
-
-    def _candidate_sample_rates() -> List[int]:
+    def _candidate_sample_rates(device_index: int) -> List[int]:
         candidates: List[int] = []
         try:
             dev_info = sd.query_devices(device_index)
@@ -1512,83 +1552,96 @@ def audio_monitor(controller):
                 candidates.append(rate)
         return candidates
 
-    opened = False
-    last_error: Optional[Exception] = None
-    tried_rates = _candidate_sample_rates()
-
-    try:
-        for samplerate in tried_rates:
+    def _listen(stream, samplerate: int, device_index: int, device_name: str) -> None:
+        """Reads the mic until shutdown; raises if the stream fails (mic unplugged)."""
+        tracker = BeatTracker(np, samplerate, blocksize)
+        active = False; last_log = 0.0
+        recent: deque = deque(maxlen=int(PARTY_RECORD_SECONDS * samplerate / blocksize))
+        logging.info(
+            f"Audio monitor started (device={device_index}: {device_name}, rate={samplerate}Hz)"
+        )
+        while controller.state.running:
+            data, overflowed = stream.read(blocksize)
+            if overflowed:
+                logging.debug(f"Audio input overflow: {overflowed}")
+            if data.size == 0:
+                continue
+            samples = data[:, 0] if data.ndim > 1 else data
+            now = time()
+            with controller.state.lock:
+                mode = controller.state.current_mode
+                party = mode == 'party'
+                click = now < controller.state.mode_state.get('click_until', 0.0)
+                if not party and active:
+                    controller.state.party_status = {}
+            if mode == 'audio_vu':
+                rms = float(np.sqrt(np.mean(np.square(samples))))
+                peak = float(np.max(np.abs(samples)))
+                _update_vu_level(controller, max(rms, peak * 0.35))
+            # Only analyse while Party is on; the stream keeps running
+            # so the mic doesn't need re-opening every time.
+            if not party:
+                active = False
+                continue
+            if not active:
+                tracker.reset(); active = True; recent.clear()
+            recent.append(samples.copy())
+            if controller.state.mode_state.pop('party_record', False):
+                _save_party_recording(np, recent, samplerate)
             try:
-                with sd.InputStream(
-                    device=device_index,
-                    channels=1,
-                    samplerate=samplerate,
-                    blocksize=blocksize,
-                    dtype='float32',
-                    latency='low',
-                ) as stream:
-                    opened = True
-                    tracker = BeatTracker(np, samplerate, blocksize)
-                    active = False; last_log = 0.0
-                    recent: deque = deque(maxlen=int(PARTY_RECORD_SECONDS * samplerate / blocksize))
-                    logging.info(
-                        f"Audio monitor started (device={device_index}: {device_name}, rate={samplerate}Hz)"
-                    )
-                    while controller.state.running:
-                        data, overflowed = stream.read(blocksize)
-                        if overflowed:
-                            logging.debug(f"Audio input overflow: {overflowed}")
-                        if data.size == 0:
-                            continue
-                        samples = data[:, 0] if data.ndim > 1 else data
-                        now = time()
-                        with controller.state.lock:
-                            mode = controller.state.current_mode
-                            party = mode == 'party'
-                            click = now < controller.state.mode_state.get('click_until', 0.0)
-                            if not party and active:
-                                controller.state.party_status = {}
-                        if mode == 'audio_vu':
-                            rms = float(np.sqrt(np.mean(np.square(samples))))
-                            peak = float(np.max(np.abs(samples)))
-                            _update_vu_level(controller, max(rms, peak * 0.35))
-                        # Only analyse while Party is on; the stream keeps running
-                        # so the mic doesn't need re-opening every time.
-                        if not party:
-                            active = False
-                            continue
-                        if not active:
-                            tracker.reset(); active = True; recent.clear()
-                        recent.append(samples.copy())
-                        if controller.state.mode_state.pop('party_record', False):
-                            _save_party_recording(np, recent, samplerate)
-                        try:
-                            tracker.process(samples, now, mask_mid=click)
-                            status = tracker.status(now)
-                        except Exception as e:
-                            # Keep the stream alive; start the analysis over.
-                            logging.error(f"Party tracker error: {e}")
-                            tracker.reset(); continue
-                        with controller.state.lock:
-                            controller.state.party_status = status
-                        if now - last_log >= PARTY_LOG_INTERVAL:
-                            last_log = now
-                            logging.info(
-                                f"Party: vibe={status['vibe']} bpm={status['bpm']} conf={status['confidence']} "
-                                f"db={status['db']} rel={status['rel_db']}"
-                            )
-                    break
+                tracker.process(samples, now, mask_mid=click)
+                status = tracker.status(now)
             except Exception as e:
-                last_error = e
-                logging.warning(
-                    f"Audio: failed opening InputStream at {samplerate}Hz on device {device_index} ({device_name}): {e}"
+                # Keep the stream alive; start the analysis over.
+                logging.error(f"Party tracker error: {e}")
+                tracker.reset(); continue
+            with controller.state.lock:
+                controller.state.party_status = status
+            if now - last_log >= PARTY_LOG_INTERVAL:
+                last_log = now
+                logging.info(
+                    f"Party: vibe={status['vibe']} bpm={status['bpm']} conf={status['confidence']} "
+                    f"db={status['db']} rel={status['rel_db']}"
                 )
 
-        if not opened:
-            logging.error(
-                f"Audio monitor error: unable to open InputStream on device {device_index} ({device_name}). "
-                f"Tried rates={tried_rates}. Last error: {last_error}"
-            )
+    # Find the mic and open it; if it's missing or fails later (unplugged), look
+    # again with a growing pause instead of leaving Party and VU dead until a restart.
+    retry = AUDIO_RETRY_SECONDS
+    try:
+        while controller.state.running:
+            device_index, device_name = _resolve_input_device()
+            if device_index is None:
+                logging.warning("Audio: no input-capable audio device found")
+            else:
+                last_error: Optional[Exception] = None
+                tried_rates = _candidate_sample_rates(device_index)
+                for samplerate in tried_rates:
+                    try:
+                        stream = sd.InputStream(device=device_index, channels=1, samplerate=samplerate,
+                                                blocksize=blocksize, dtype='float32', latency='low')
+                    except Exception as e:
+                        last_error = e
+                        logging.warning(f"Audio: failed opening InputStream at {samplerate}Hz on device {device_index} ({device_name}): {e}")
+                        continue
+                    try:
+                        with stream:
+                            retry = AUDIO_RETRY_SECONDS
+                            _listen(stream, samplerate, device_index, str(device_name))
+                    except Exception as e:
+                        logging.error(f"Audio: stream on {device_name} stopped: {e}")
+                    break
+                else:
+                    logging.error(f"Audio: unable to open device {device_index} ({device_name}), tried rates={tried_rates}. Last error: {last_error}")
+            if not controller.state.running:
+                break
+            with controller.state.lock:
+                controller.state.party_status = {}
+            logging.info(f"Audio: looking for the mic again in {retry:.0f} s")
+            sleep(retry); retry = min(retry * 2, AUDIO_RETRY_MAX_SECONDS)
+            try:  # PortAudio only sees a re-plugged device after a rescan
+                sd._terminate(); sd._initialize()
+            except Exception:
+                pass
     finally:
         with controller.state.lock:
             controller.state.party_status = {}
@@ -1596,7 +1649,10 @@ def audio_monitor(controller):
 # SimHub UDP
 
 def network_monitor(controller):
-    prev: Optional[bool] = None
+    # A Wi-Fi drop switches to the traffic light cycle; when it's back, the mode
+    # picked before the drop returns.
+    with controller.state.lock:
+        prev: Optional[bool] = controller.state.network_connected  # main() already set the mode for this
     while controller.state.running:
         try:
             connected = _is_network_connected()
@@ -1606,9 +1662,8 @@ def network_monitor(controller):
             controller.state.network_connected = connected
             if connected != prev:
                 if connected:
-                    controller.state.target_mode = 'manual'
-                    controller.state.target_manual_color = 'off'
-                    logging.info("Network up -> target manual/off")
+                    controller.restore_choice()
+                    logging.info(f"Network up -> back to {controller.state.target_mode}")
                 else:
                     controller.state.target_mode = 'auto'
                     logging.info("Network down -> target auto")
@@ -1878,7 +1933,7 @@ _HTML = f"""
                 seg.style.opacity = lit ? (0.35 + 0.65 * level) : 1;
             }});
         }}
-        function updateVisuals(color, mode, s_bahn_minutes, weather, race_step, space_weather, traffic, party, s_bahn_transit, environment, gremio, simhub_rev_pct, audio_level) {{
+        function updateVisuals(color, mode, s_bahn_minutes, race_step, space_weather, traffic, party, s_bahn_transit, environment, gremio, simhub_rev_pct, audio_level) {{
             updateBar(color, mode, s_bahn_minutes, space_weather, traffic, party, environment, simhub_rev_pct, audio_level);
             if (currentModeFromServer !== mode) {{
                 rememberSub(mode);
@@ -1898,7 +1953,8 @@ _HTML = f"""
                 infoDisplay.textContent = base;
             }}
             else if (mode === 'biergarten') {{
-                if (weather && weather.temp && weather.condition) {{ infoDisplay.textContent = `${{weather.temp.toFixed(1)}}°C, ${{weather.condition}}`; }}
+                const e = environment || {{}};
+                if (typeof e.temp === 'number' && e.condition) {{ infoDisplay.textContent = `${{e.temp.toFixed(1)}}°C, ${{e.condition}}`; }}
                 else {{ infoDisplay.textContent = 'No weather data.'; }}
             }}
             else if (mode === 'race_start') {{
@@ -1932,7 +1988,6 @@ _HTML = f"""
             }}
             else if (mode === 'uv') {{
                 const e = environment || {{}};
-                const w = weather || {{}};
                 const parts = [];
                 if (typeof e.uv_index === 'number') {{
                     let band = 'low';
@@ -1943,8 +1998,8 @@ _HTML = f"""
                 }} else {{
                     parts.push('UV n/a');
                 }}
-                if (typeof w.temp === 'number' && w.condition) {{
-                    parts.push(`${{w.temp.toFixed(0)}}°C ${{w.condition}}`);
+                if (typeof e.temp === 'number' && e.condition) {{
+                    parts.push(`${{e.temp.toFixed(0)}}°C ${{e.condition}}`);
                 }}
                 if (e.aqi_label) {{
                     parts.push(`Air ${{e.aqi_label}}`);
@@ -1996,17 +2051,17 @@ _HTML = f"""
                     const vs = g.home_away === 'home' ? 'vs' : '@';
                     let dateStr = '';
                     if (g.date) {{
-                        const d2 = new Date(g.date + 'T12:00Z');
-                        dateStr = ` · ${{days[d2.getUTCDay()]}} ${{d2.getUTCDate()}} ${{months[d2.getUTCMonth()]}}`;
+                        const d2 = new Date(g.date.length > 10 ? g.date : g.date + 'T12:00Z');
+                        dateStr = ` · ${{days[d2.getDay()]}} ${{d2.getDate()}} ${{months[d2.getMonth()]}}`;
                     }}
                     parts.push(`Last: ${{tag}} ${{g.score}} ${{vs}} ${{g.opponent || '?'}}${{dateStr}}`);
                 }}
                 if (g.next_match_date) {{
                     const d = new Date(g.next_match_date);
-                    const hh = d.getUTCHours().toString().padStart(2,'0');
-                    const mm = d.getUTCMinutes().toString().padStart(2,'0');
+                    const hh = d.getHours().toString().padStart(2,'0');
+                    const mm = d.getMinutes().toString().padStart(2,'0');
                     const vs2 = g.next_match_home_away === 'home' ? 'vs' : '@';
-                    parts.push(`Next: ${{vs2}} ${{g.next_match_opponent || '?'}} · ${{days[d.getUTCDay()]}} ${{d.getUTCDate()}} ${{months[d.getUTCMonth()]}} ${{hh}}:${{mm}}`);
+                    parts.push(`Next: ${{vs2}} ${{g.next_match_opponent || '?'}} · ${{days[d.getDay()]}} ${{d.getDate()}} ${{months[d.getMonth()]}} ${{hh}}:${{mm}}`);
                 }}
                 if (parts.length) {{
                     infoDisplay.innerHTML = parts.join('<br>');
@@ -2062,7 +2117,7 @@ _HTML = f"""
             let sosIndex = 0;
             function runSosStep() {{
                 if (currentModeFromServer !== 'sos') return;
-                const step = sosPattern[sosIndex]; updateVisuals(step.state, 'sos', -1, {{}}, 0, {{}}, {{}}, 0, {{}}, {{}}, {{}});
+                const step = sosPattern[sosIndex]; updateVisuals(step.state, 'sos', -1, 0, {{}}, {{}}, {{}}, {{}}, {{}}, {{}});
                 sosIndex = (sosIndex + 1) % sosPattern.length;
                 localAnimationId = setTimeout(runSosStep, step.duration);
             }}
@@ -2081,7 +2136,9 @@ _HTML = f"""
         function handleGroupClick(g) {{
             // Tapping the active group turns it off (the Pi toggles a mode set twice);
             // otherwise start the sub-mode used last.
-            const mode = GROUP_OF[currentModeFromServer] === g ? currentModeFromServer : (lastSub[g] || GROUPS[g].modes[0]);
+            // A remembered sub-mode that no longer exists falls back to the first one.
+            const remembered = GROUPS[g].modes.includes(lastSub[g]) ? lastSub[g] : GROUPS[g].modes[0];
+            const mode = GROUP_OF[currentModeFromServer] === g ? currentModeFromServer : remembered;
             handleModeClick(mode);
         }}
         function selectSub(mode) {{
@@ -2097,7 +2154,7 @@ _HTML = f"""
         function applyStatus(status) {{
             lastStatus = status;
             if (localAnimationId) return;
-            updateVisuals(status.color, status.mode, status.s_bahn_minutes, status.weather, status.race_step, status.space_weather, status.traffic, status.party, status.s_bahn_transit, status.environment, status.gremio, status.simhub_rev_pct, status.audio_level);
+            updateVisuals(status.color, status.mode, status.s_bahn_minutes, status.race_step, status.space_weather, status.traffic, status.party, status.s_bahn_transit, status.environment, status.gremio, status.simhub_rev_pct, status.audio_level);
         }}
         let eventSource = null;
         function connectEvents() {{
@@ -2135,18 +2192,22 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-cache')
         self.send_header('Connection', 'keep-alive')
         self.end_headers()
-        last_payload = None
+        last_payload = None; last_write = 0.0
         try:
             while self.controller.state.running:
-                payload = json.dumps(self.controller.get_status())
+                # Check 20x a second but only write when something changed, plus a
+                # keepalive now and then, so an idle phone's radio can sleep.
+                payload = json.dumps(self.controller.get_status()); now = time()
                 if payload != last_payload:
                     self.wfile.write(f"data: {payload}\n\n".encode())
                     last_payload = payload
-                else:
+                elif now - last_write >= SSE_KEEPALIVE_SECONDS:
                     self.wfile.write(b": ping\n\n")
-                self.wfile.flush()
+                else:
+                    sleep(0.05); continue
+                self.wfile.flush(); last_write = now
                 sleep(0.05)
-        except (BrokenPipeError, ConnectionResetError):
+        except OSError:  # browser gone: broken pipe, reset, timeout
             pass
     def _index(self,p):
         q = parse_qs(p.query); act = q.get('action',[None])[0]
@@ -2162,7 +2223,7 @@ class _Handler(BaseHTTPRequestHandler):
                     with self.controller.state.lock: self.controller.state.mode_state['party_record'] = True
                 self.send_response(200); self.end_headers(); return
             except Exception as e:
-                logging.error(f"action error {act}: {e}"); self._err(400,'bad'); return
+                logging.warning(f"action error {act}: {e}"); self._err(400, str(e)); return
         self._html(_HTML)
     def _json(self, data: Dict):
         self.send_response(200); self.send_header('Content-type','application/json'); self.send_header('Cache-Control','no-cache'); self.end_headers(); self.wfile.write(json.dumps(data).encode())
@@ -2231,7 +2292,7 @@ class TrafficLightController:
         return LightHardware(use_mock=True)
     def set_light_state(self, color: str) -> None:
         with self.state.lock:
-            if self.state.current_color == color: return
+            if self.state.current_color == color or not self.state.running: return
             prev = self.state.current_color
             try:
                 self.hardware.set_state(color); self.state.current_color = color
@@ -2246,18 +2307,46 @@ class TrafficLightController:
             except Exception as e:
                 logging.error(f"Failed to set light {color}: {e}")
     def set_mode(self, mode: str) -> None:
+        if mode not in self.mode_handlers and mode not in ('manual', 'idle'):
+            raise ValueError(f"unknown mode {mode!r}")
         with self.state.lock:
             if self.state.current_mode == mode:
                 self.state.target_mode = 'idle'; logging.info(f"Toggle off mode {mode}")
             else:
                 self.state.target_mode = mode; logging.info(f"Switch to mode {mode}")
+            self._remember_choice()
     def set_manual_color(self, color: str) -> None:
+        if color not in LIGHT_STATES:
+            raise ValueError(f"unknown color {color!r}")
         with self.state.lock:
             if self.state.current_mode == 'manual' and self.state.current_color == color:
                 self.state.target_manual_color = 'off'
             else:
                 self.state.target_manual_color = color
             self.state.target_mode = 'manual'; logging.info(f"Manual color {color}")
+            self._remember_choice()
+    def _remember_choice(self) -> None:
+        # Caller holds the lock.
+        self.state.chosen_mode = self.state.target_mode; self.state.chosen_color = self.state.target_manual_color
+        try:
+            with open(LAST_MODE_FILE, 'w', encoding='utf-8') as f:
+                json.dump({'mode': self.state.chosen_mode, 'color': self.state.chosen_color}, f)
+        except OSError as e:
+            logging.warning(f"Could not save the mode to {LAST_MODE_FILE}: {e}")
+    def load_choice(self) -> None:
+        try:
+            with open(LAST_MODE_FILE, encoding='utf-8') as f:
+                saved = json.load(f)
+        except (OSError, ValueError):
+            return
+        mode, color = saved.get('mode'), saved.get('color', 'off')
+        if (mode in self.mode_handlers or mode in ('manual', 'idle')) and color in LIGHT_STATES:
+            with self.state.lock:
+                self.state.chosen_mode, self.state.chosen_color = mode, color
+            logging.info(f"Last mode: {mode}" + (f" ({color})" if mode == 'manual' else ''))
+    def restore_choice(self) -> None:
+        # Caller holds the lock.
+        self.state.target_mode = self.state.chosen_mode; self.state.target_manual_color = self.state.chosen_color
     def get_status(self) -> Dict:
         with self.state.lock: return self.state.snapshot()
     def run_initialization_sequence(self):
@@ -2323,8 +2412,11 @@ class TrafficLightController:
             self.set_light_state('off')
     def shutdown(self):
         logging.info("Shutdown initiated")
-        with self.state.lock: self.state.running = False
-        self.hardware.all_off(); self.hardware.cleanup(); logging.info("Shutdown complete")
+        # Under the lock, so no handler is mid-switch; set_light_state refuses once running is off.
+        with self.state.lock:
+            self.state.running = False
+            self.hardware.cleanup()
+        logging.info("Shutdown complete")
 
 # --------------------------- Main ------------------------------------------
 
@@ -2346,13 +2438,14 @@ def main():
 
     # Prime network state once before threads start so the first tick has
     # a correct target mode; the network_monitor thread keeps it in sync.
+    # Offline it runs the traffic light cycle; online, whatever was picked last.
+    ctrl.load_choice()
     try:
         connected = _is_network_connected()
         with ctrl.state.lock:
             ctrl.state.network_connected = connected
             if connected:
-                ctrl.state.target_mode = 'manual'
-                ctrl.state.target_manual_color = 'off'
+                ctrl.restore_choice()
             else:
                 ctrl.state.target_mode = 'auto'
     except Exception:
@@ -2369,7 +2462,6 @@ def main():
     threads = [
         threading.Thread(target=ctrl.run, name='controller', daemon=True),
         threading.Thread(target=s_bahn_monitor, args=(ctrl,), name='s_bahn', daemon=True),
-        threading.Thread(target=weather_monitor, args=(ctrl,), name='weather', daemon=True),
         threading.Thread(target=space_weather_monitor, args=(ctrl,), name='space', daemon=True),
         threading.Thread(target=traffic_monitor, args=(ctrl,), name='traffic', daemon=True),
         threading.Thread(target=simhub_udp_listener, args=(ctrl,), name='simhub', daemon=True),

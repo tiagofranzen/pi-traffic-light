@@ -43,7 +43,7 @@ from the chips under the light, which also show what each colour means.
 | Weather | Temperature | Outside temperature: green 15-26°C, yellow 5-15 or 26-30°C, red beyond |, |
 | | Rain | Rain forecast: green dry for 3 h, yellow rain within 3 h, red raining or within the hour |, |
 | | UV | Current UV index |, |
-| | Biergarten | Temperature / weather / time of day | OpenWeatherMap key |
+| | Biergarten | Temperature / weather / time of day: red before 16:00, below 15°C or with rain, snow or thunder |, |
 | | Space | Geomagnetic Kp index (aurora/storm risk) |, |
 | Commute | S-Bahn | Minutes to your next train | Deutsche Bahn API keys |
 | | Stau | How bad your commute is right now | TomTom or Google Maps key |
@@ -82,7 +82,7 @@ Open `http://<pi-ip>:8000`. Add it to your phone's home screen if you
 want to pretend it's a real app.
 
 Optional environment variables, only needed for the modes that ask for a
-key above: `DB_CLIENT_ID` / `DB_CLIENT_SECRET`, `OWM_API_KEY`,
+key above: `DB_CLIENT_ID` / `DB_CLIENT_SECRET`,
 `TOMTOM_API_KEY` (or `GOOGLE_MAPS_API_KEY` as a fallback),
 `AUDIO_INPUT_DEVICE`. Where you are lives in the environment too, never
 in the code: `WEATHER_LAT` / `WEATHER_LON` (defaults to Munich centre),
