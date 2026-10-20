@@ -176,25 +176,15 @@ RAIN_RED_MINUTES = 60              # rain this soon (or now) -> red
 RAIN_YELLOW_MINUTES = 180          # rain within this -> yellow, else green
 
 # Clock mode - quarter chimes like an old striking clock, as sweeps along the
-# light (green bottom, red top). Lamps stay on as the sweep adds the next one,
-# then all go dark together: up = green, +yellow, +red; down = red, +yellow,
-# +green.
-# :15 = up, :30 = up+down, :45 = up+down+up,
-# :00 = up+down+up+down, then one yellow blink per hour (12h).
-# Between chimes the lamps stay off, like a clock that's silent until it
-# strikes (and it saves power).
-CLOCK_BEAT = 0.75                  # time before the next lamp joins in a sweep
-CLOCK_SWEEP_GAP = 0.75             # dark pause between sweeps
-CLOCK_HOUR_GAP = 1.5               # pause between the last sweep and the first strike
+# light (green bottom, red top), rung with the Westminster Quarters (Big Ben's
+# tune, 1793) on synthesised bells when there's a speaker. Each sweep is one
+# change of four notes: the lamps join on the first three (up = green, +yellow,
+# +red; down = red, +yellow, +green) and all go dark on the long fourth.
+# :15 = 1 change, :30 = 2, :45 = 3, :00 = 4, then the hour bell strikes with
+# each yellow blink (12h). Between chimes the lamps stay off. The volume (and
+# mute) is set from the bar next to the light in the web UI.
 CLOCK_STRIKE_ON = 0.75             # how long each hour strike stays lit
-CLOCK_STRIKE_INTERVAL = 1.5        # strike to strike
 CLOCK_QUIET_HOURS = (23, 7)        # no chimes from 23:00 to 06:59 (relays click)
-
-# Westminster (Clock sub-mode) - the same clock, with the Westminster Quarters
-# (Big Ben's tune, 1793) rung on synthesised bells through the speaker. Each
-# sweep is one change of four notes: the lamps join on the first three and all
-# go dark on the long fourth. :15 = 1 change, :30 = 2, :45 = 3,
-# :00 = 4, then the hour bell strikes with each yellow blink.
 WESTMINSTER_BELLS = (415.30, 369.99, 329.63, 246.94)   # G#4 F#4 E4 B3
 WESTMINSTER_HOUR_BELL = 164.81                         # E3
 WESTMINSTER_CHANGES = ((0, 1, 2, 3), (2, 0, 1, 3), (2, 1, 0, 2), (0, 2, 1, 3), (3, 1, 0, 2))
@@ -202,7 +192,7 @@ WESTMINSTER_QUARTERS = {1: (0,), 2: (1, 2), 3: (3, 4, 0), 4: (1, 2, 3, 4)}
 WESTMINSTER_BEAT = 0.7             # note to note; the fourth note of a change rings two beats
 WESTMINSTER_HOUR_GAP = 1.5         # after the last change, before the first hour strike
 WESTMINSTER_STRIKE_INTERVAL = 2.2  # hour strike to hour strike
-CHIME_VOLUME = float(os.getenv("CHIME_VOLUME", "0.5"))  # 0..1, on top of the system volume
+CHIME_VOLUME = float(os.getenv("CHIME_VOLUME", "0.5"))  # starting volume 0..1 (on top of the system volume), until set in the UI
 CHIME_PLAYER = os.getenv("CHIME_PLAYER", "").strip()    # e.g. "aplay -D plughw:CARD=UC"; default: PipeWire/Pulse/ALSA, whichever is there
 CHIME_LATENCY_SECONDS = 0.12       # the player starts this late; the bells are rung this much earlier
 
@@ -277,6 +267,8 @@ class SharedState:
     # What was last picked in the UI: restored when the network comes back and after a restart.
     chosen_mode: str = 'manual'
     chosen_color: str = 'off'
+    chime_volume: float = max(0.0, min(CHIME_VOLUME, 1.0))  # Clock bells; 0 = muted
+    chime_volume_on: float = max(0.05, min(CHIME_VOLUME, 1.0))  # the level unmuting returns to
     mode_state: Dict = field(default_factory=lambda: {
         'next_auto_state': 'green',
         'sos_index': 0,
@@ -320,6 +312,7 @@ class SharedState:
             'party': self.party_status.copy(),
             'audio_level': self.audio_vu_level,
             'network_connected': self.network_connected,
+            'chime_volume': round(self.chime_volume, 2),
         }
 
 # --------------------------- Hardware --------------------------------------
@@ -628,23 +621,6 @@ def _clock_quiet(hour: int) -> bool:
     start, end = CLOCK_QUIET_HOURS
     return (hour >= start or hour < end) if start > end else (start <= hour < end)
 
-def clock_chime_sequence(quarter: int, hour12: int) -> List[Tuple[str, float]]:
-    """Steps for one chime. quarter 1..3 = :15/:30/:45, 4 = full hour (+ hour strikes)."""
-    seq: List[Tuple[str, float]] = [('off', 1.0)]  # a beat of darkness before the chime
-    up = ['green', 'green-yellow', 'all_on']
-    down = ['red', 'red_and_yellow', 'all_on']
-    for i in range(quarter):
-        if i:
-            seq.append(('off', CLOCK_SWEEP_GAP))
-        for color in (up if i % 2 == 0 else down):
-            seq.append((color, CLOCK_BEAT))
-    seq.append(('off', CLOCK_HOUR_GAP if quarter == 4 else 1.0))
-    if quarter == 4:
-        for i in range(hour12):
-            seq.append(('yellow', CLOCK_STRIKE_ON))
-            seq.append(('off', CLOCK_STRIKE_INTERVAL - CLOCK_STRIKE_ON if i + 1 < hour12 else 1.0))
-    return seq
-
 def westminster_sequence(quarter: int, hour12: int) -> Tuple[List[Tuple[str, float]], List[Tuple[float, float, float]]]:
     """Light steps and bell notes (start s, Hz, strength) for one chime; quarter 4 = full hour."""
     b = WESTMINSTER_BEAT; t = 1.0
@@ -681,7 +657,7 @@ def _bell_tone(np, freq: float, rate: int):
         _bell_tones[freq] = tone * np.minimum(tt / 0.004, 1.0)  # 4 ms strike
     return _bell_tones[freq]
 
-def _render_bells(np, notes: List[Tuple[float, float, float]], rate: int = 44100):
+def _render_bells(np, notes: List[Tuple[float, float, float]], volume: float, rate: int = 44100):
     end = max(t for t, _, _ in notes) + 5.0
     out = np.zeros(int(end * rate), dtype=np.float64)
     for start, freq, strength in notes:
@@ -690,7 +666,7 @@ def _render_bells(np, notes: List[Tuple[float, float, float]], rate: int = 44100
         n = min(len(tone), len(out) - i)
         out[i:i + n] += tone[:n] * strength
     peak = float(np.max(np.abs(out))) or 1.0
-    return (out / peak * max(0.0, min(CHIME_VOLUME, 1.0)) * 32767).astype('<i2')
+    return (out / peak * max(0.0, min(volume, 1.0)) * 32767).astype('<i2')
 
 _chime_proc: Optional[subprocess.Popen] = None
 
@@ -708,14 +684,17 @@ def stop_chime(wait: bool = True) -> None:
         except subprocess.TimeoutExpired: _chime_proc.kill(); _chime_proc.wait()
     _chime_proc = None
 
-def play_chime(notes: List[Tuple[float, float, float]]) -> None:
-    """Renders the bells and starts playing them now, in the background."""
+def play_chime(notes: List[Tuple[float, float, float]], volume: float) -> None:
+    """Renders the bells and starts playing them now, in the background. Volume 0 = muted."""
     global _chime_proc
+    stop_chime()
+    if volume <= 0:
+        return
     import wave
     try:
         import numpy as np  # type: ignore
     except ImportError:
-        logging.warning("Westminster: numpy missing, no bells"); return
+        logging.warning("Clock: numpy missing, no bells"); return
     env = dict(os.environ)
     if CHIME_PLAYER:
         cmd = shlex.split(CHIME_PLAYER)
@@ -727,34 +706,28 @@ def play_chime(notes: List[Tuple[float, float, float]]) -> None:
         elif shutil.which('paplay') and os.path.exists(f"{runtime}/pulse/native"): cmd = ['paplay']
         elif shutil.which('aplay'): cmd = ['aplay', '-q']
         else:
-            logging.warning("Westminster: no audio player found (pw-play, paplay or aplay)"); return
+            logging.warning("Clock: no audio player found (pw-play, paplay or aplay)"); return
     path = os.path.join(tempfile.gettempdir(), 'traffic_light_chime.wav')
     try:
-        pcm = _render_bells(np, notes)
+        pcm = _render_bells(np, notes, volume)
         with wave.open(path, 'wb') as w:
             w.setnchannels(1); w.setsampwidth(2); w.setframerate(44100); w.writeframes(pcm.tobytes())
-        stop_chime()
         _chime_proc = subprocess.Popen(cmd + [path], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as e:
-        logging.error(f"Westminster: playing the bells failed: {e}")
+        logging.error(f"Clock: playing the bells failed: {e}")
 
-def _start_clock_chime(ms: Dict, bells: bool, quarter: int, hour12: int) -> None:
-    if bells:
-        ms['clock_seq'], notes = westminster_sequence(quarter, hour12)
-        play_chime(notes)  # the light sequence starts right after, in step with the sound
-    else:
-        ms['clock_seq'] = clock_chime_sequence(quarter, hour12)
+def _start_clock_chime(controller, quarter: int, hour12: int) -> None:
+    ms = controller.state.mode_state
+    ms['clock_seq'], notes = westminster_sequence(quarter, hour12)
+    play_chime(notes, controller.state.chime_volume)  # the lights start right after, in step with the bells
     ms['clock_idx'] = -1; ms['clock_step_until'] = time()  # the chime starts now (the bells too)
 
-def handle_westminster_mode(controller, elapsed: float) -> Optional[float]:
-    return handle_clock_mode(controller, elapsed, bells=True)
-
-def handle_clock_mode(controller, elapsed: float, bells: bool = False) -> Optional[float]:
+def handle_clock_mode(controller, elapsed: float) -> Optional[float]:
     ms = controller.state.mode_state; now = time(); dt = datetime.now()
     forced = ms.pop('clock_force', None)  # /?action=chime: ring this one now, to test
     if forced:
         ms['clock_last_key'] = (dt.date().isoformat(), dt.hour, dt.minute // 15)  # don't chime the real time on top
-        _start_clock_chime(ms, bells, *forced)
+        _start_clock_chime(controller, *forced)
         return 0.02
     seq = ms.get('clock_seq')
     if seq:
@@ -778,7 +751,7 @@ def handle_clock_mode(controller, elapsed: float, bells: bool = False) -> Option
         entering = ms.get('clock_last_key') is None
         ms['clock_last_key'] = key
         if entering or not _clock_quiet(dt.hour):
-            _start_clock_chime(ms, bells, q or 4, dt.hour % 12 or 12)
+            _start_clock_chime(controller, q or 4, dt.hour % 12 or 12)
             return 0.02
     controller.set_light_state('off')
     return 0.2
@@ -1886,6 +1859,10 @@ _HTML = f"""
     .led-strip{{position:absolute;top:0;bottom:0;left:100%;margin-left:14px;width:16px;display:flex;flex-direction:column-reverse;gap:4px;padding:2px;opacity:0;pointer-events:none;transition:opacity .15s}}
     .led-strip.visible{{opacity:1}}
     .led-seg{{flex:1 1 0;border-radius:2px;background:#2a2d33;transition:all .12s}}
+    .led-strip.volume{{pointer-events:auto;cursor:ns-resize;touch-action:none;width:22px;margin-left:11px;bottom:34px}}
+    .vol-mute{{position:absolute;left:100%;bottom:0;margin-left:8px;width:28px;height:28px;padding:4px;border:0;border-radius:50%;background:rgba(255,255,255,.06);color:var(--text-muted);cursor:pointer;display:none;touch-action:manipulation}}
+    .vol-mute.visible{{display:block}}
+    .vol-mute svg{{width:100%;height:100%;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}}
     .gremio-stars{{position:absolute;top:-16px;left:50%;transform:translateX(-50%);display:none;gap:8px;align-items:center;justify-content:center;pointer-events:none}}
     .gremio-stars.visible{{display:flex}}
     .gremio-stars svg{{width:12px;height:12px}}
@@ -1897,7 +1874,7 @@ _HTML = f"""
     <body><div class="container">
     <div class="topbar"><div class="brand">Traffic Light</div><div class="conn-pill live" id="connPill"><div class="conn-dot"></div><span id="connLabel">Live</span></div></div>
     <div class="glass-card">
-    <div class="stage"><div class="gremio-stars" id="gremioStars"><svg viewBox="0 0 24 24" fill="#93754F"><path d="M12 2l2.9 6.6L22 9.3l-5 4.8 1.3 7.1L12 17.8 5.7 21.2 7 14.1 2 9.3l7.1-.7z"/></svg><svg viewBox="0 0 24 24" fill="#ABAAAA"><path d="M12 2l2.9 6.6L22 9.3l-5 4.8 1.3 7.1L12 17.8 5.7 21.2 7 14.1 2 9.3l7.1-.7z"/></svg><svg viewBox="0 0 24 24" fill="#F8C300"><path d="M12 2l2.9 6.6L22 9.3l-5 4.8 1.3 7.1L12 17.8 5.7 21.2 7 14.1 2 9.3l7.1-.7z"/></svg></div><div class="traffic-light-body" id="traffic-light"><div id="red" class="light" onclick="handleLightClick('red')"><svg class="gremio-face" id="gremioFaceRed" viewBox="0 0 40 40"></svg></div><div id="yellow" class="light" onclick="handleLightClick('yellow')"><svg class="gremio-face" id="gremioFaceYellow" viewBox="0 0 40 40"></svg></div><div id="green" class="light" onclick="handleLightClick('green')"><svg class="gremio-face" id="gremioFaceGreen" viewBox="0 0 40 40"></svg></div></div><div class="led-strip" id="ledStrip"></div></div>
+    <div class="stage"><div class="gremio-stars" id="gremioStars"><svg viewBox="0 0 24 24" fill="#93754F"><path d="M12 2l2.9 6.6L22 9.3l-5 4.8 1.3 7.1L12 17.8 5.7 21.2 7 14.1 2 9.3l7.1-.7z"/></svg><svg viewBox="0 0 24 24" fill="#ABAAAA"><path d="M12 2l2.9 6.6L22 9.3l-5 4.8 1.3 7.1L12 17.8 5.7 21.2 7 14.1 2 9.3l7.1-.7z"/></svg><svg viewBox="0 0 24 24" fill="#F8C300"><path d="M12 2l2.9 6.6L22 9.3l-5 4.8 1.3 7.1L12 17.8 5.7 21.2 7 14.1 2 9.3l7.1-.7z"/></svg></div><div class="traffic-light-body" id="traffic-light"><div id="red" class="light" onclick="handleLightClick('red')"><svg class="gremio-face" id="gremioFaceRed" viewBox="0 0 40 40"></svg></div><div id="yellow" class="light" onclick="handleLightClick('yellow')"><svg class="gremio-face" id="gremioFaceYellow" viewBox="0 0 40 40"></svg></div><div id="green" class="light" onclick="handleLightClick('green')"><svg class="gremio-face" id="gremioFaceGreen" viewBox="0 0 40 40"></svg></div></div><div class="led-strip" id="ledStrip"></div><button type="button" class="vol-mute" id="volMute" aria-label="Mute the bells" onclick="toggleMute()"></button></div>
     <div class="controls"><h2 id="modeText"><strong></strong></h2><div id="info-display" class="info-text"></div></div>
     <div class="subs empty" id="subs"><div class="chips" id="chips"></div><div class="rule" id="rule"></div></div>
     </div>
@@ -1924,7 +1901,7 @@ _HTML = f"""
             party: {{name: 'Party', modes: ['party', 'audio_vu']}},
             racing: {{name: 'Racing', modes: ['race_start', 'racing', 'hotlap']}},
             gremio: {{name: 'Grêmio', modes: ['gremio']}},
-            clock: {{name: 'Clock', modes: ['clock', 'westminster']}},
+            clock: {{name: 'Clock', modes: ['clock']}},
         }};
         // Sub-mode name and colour ranges (r/y/g/a = red/yellow/green/all), from the Pi's own settings.
         const SUBS = {{
@@ -1940,8 +1917,6 @@ _HTML = f"""
             racing: {{name: 'Revs', rule: [['g', 'shift light'], ['y', 'shift now (green + yellow)'], ['r', 'redline (all)']]}},
             race_start: {{name: 'Start', rule: [['r', 'start lights on'], ['y', 'get ready or yellow flag'], ['g', 'go or green flag']]}},
             hotlap: {{name: 'Hotlap', rule: [['g', 'faster than your best lap'], ['y', 'slower'], ['r', 'lap invalid']]}},
-            clock: {{name: 'Silent', rule: [['a', 'lamp sweeps every 15 min'], ['y', 'one blink per hour']]}},
-            westminster: {{name: 'Westminster', rule: [['a', 'Big Ben quarters on the speaker'], ['y', 'hour bell']]}},
             party: {{name: 'Music', rule: [['a', 'random lamp on every beat'], ['a', 'dark in silence']]}},
             audio_vu: {{name: 'VU meter', rule: [['g', 'quiet'], ['y', 'loud (green + yellow)'], ['r', 'very loud (all)']]}},
         }};
@@ -1982,13 +1957,13 @@ _HTML = f"""
         }}
         // The Pi only pushes status when something changes, so the clock ticks on its own.
         setInterval(() => {{
-            if (currentModeFromServer !== 'clock' && currentModeFromServer !== 'westminster') return;
+            if (currentModeFromServer !== 'clock') return;
             document.querySelector('#modeText strong').innerHTML = clockTitle();
             document.getElementById('info-display').textContent = clockNextChime();
         }}, 1000);
         function modeTitle(mode) {{
             if (mode === 'idle') return 'OFF';
-            if (mode === 'clock' || mode === 'westminster') return clockTitle();
+            if (mode === 'clock') return clockTitle();
             const g = GROUP_OF[mode];
             if (!g) return mode.replace('_', ' ').toUpperCase();
             const name = GROUPS[g].name.toUpperCase();
@@ -2044,8 +2019,49 @@ _HTML = f"""
             }}
             return null;
         }}
+        // Clock: the bar is the bell volume - tap or drag it, the button under it mutes.
+        const VOL_HEX = '#8fb8ff';
+        const SPEAKER = '<svg viewBox="0 0 24 24"><path d="M4 9h4l5-4v14l-5-4H4z"/>';
+        let volDrag = null;  // volume shown while dragging, before it's sent
+        function showVolume(v) {{
+            const raw = v * LED_SEGMENTS.length;
+            LED_SEGMENTS.forEach((seg, i) => {{
+                const lit = i < Math.round(raw);
+                seg.classList.toggle('lit', lit);
+                seg.style.background = lit ? VOL_HEX : '#2a2d33';
+                seg.style.opacity = 1;
+            }});
+            const btn = document.getElementById('volMute');
+            btn.innerHTML = SPEAKER + (v > 0 ? '<path d="M16 9.5a3.5 3.5 0 0 1 0 5M18.5 7a7 7 0 0 1 0 10"/></svg>' : '<path d="M16 9l5 6M21 9l-5 6"/></svg>');
+            btn.setAttribute('aria-label', v > 0 ? 'Mute the bells' : 'Unmute the bells');
+        }}
+        function volumeAt(ev) {{
+            const r = document.getElementById('ledStrip').getBoundingClientRect();
+            const f = 1 - (ev.clientY - r.top) / r.height;
+            return Math.max(1, Math.min(LED_SEGMENTS.length, Math.ceil(f * LED_SEGMENTS.length))) / LED_SEGMENTS.length;
+        }}
+        function sendVolume(v) {{ fetch(`/?action=set_volume&value=${{Math.round(v * 100)}}&preview=1`); }}
+        function toggleMute() {{ fetch('/?action=set_volume&mute=toggle&preview=1'); }}
+        (() => {{
+            const strip = document.getElementById('ledStrip');
+            strip.addEventListener('pointerdown', ev => {{
+                if (currentModeFromServer !== 'clock') return;
+                strip.setPointerCapture(ev.pointerId); volDrag = volumeAt(ev); showVolume(volDrag);
+            }});
+            strip.addEventListener('pointermove', ev => {{ if (volDrag !== null) {{ volDrag = volumeAt(ev); showVolume(volDrag); }} }});
+            const done = () => {{ if (volDrag !== null) {{ sendVolume(volDrag); volDrag = null; }} }};
+            strip.addEventListener('pointerup', done); strip.addEventListener('pointercancel', done);
+        }})();
         function updateBar(color, mode, s_bahn_minutes, space_weather, traffic, party, environment, simhub_rev_pct, audio_level) {{
             const ledStrip = document.getElementById('ledStrip');
+            const clock = mode === 'clock';
+            ledStrip.classList.toggle('volume', clock);
+            document.getElementById('volMute').classList.toggle('visible', clock);
+            if (clock) {{
+                ledStrip.classList.add('visible');
+                if (volDrag === null) showVolume(lastStatus.chime_volume || 0);
+                return;
+            }}
             const pct = computeBarPct(mode, s_bahn_minutes, space_weather, traffic, party, environment, simhub_rev_pct, audio_level);
             if (pct === null) {{
                 ledStrip.classList.remove('visible');
@@ -2170,7 +2186,7 @@ _HTML = f"""
                 }}
                 else infoDisplay.textContent = `Dry for the next {RAIN_YELLOW_MINUTES // 60} h (max ${{e.rain_prob_max || 0}}%).`;
             }}
-            else if (mode === 'clock' || mode === 'westminster') {{
+            else if (mode === 'clock') {{
                 infoDisplay.textContent = clockNextChime();
             }}
             else if (mode === 'gremio') {{
@@ -2352,6 +2368,12 @@ class _Handler(BaseHTTPRequestHandler):
                 elif act=='set_mode':
                     mode = q.get('mode',[''])[0];
                     if mode: self.controller.set_mode(mode)
+                elif act=='set_volume':
+                    # value 0-100 (0 = mute), or mute=toggle; preview=1 rings one bell at the new level
+                    raw = q.get('value',[None])[0]
+                    volume = None if q.get('mute',[''])[0] == 'toggle' else float(raw) / 100.0
+                    if volume is not None and not (0.0 <= volume <= 1.0): raise ValueError("value 0-100")
+                    self.controller.set_chime_volume(volume, preview=q.get('preview',['0'])[0] == '1')
                 elif act=='chime':
                     # Test a chime: quarter 1-3 = :15/:30/:45, 4 = full hour; hour 1-12.
                     quarter = int(q.get('quarter',['4'])[0]); hour = int(q.get('hour',['12'])[0])
@@ -2394,7 +2416,6 @@ class TrafficLightController:
             'uv': handle_uv_mode,
             'gremio': handle_gremio_mode,
             'clock': handle_clock_mode,
-            'westminster': handle_westminster_mode,
             'audio_vu': handle_audio_vu_mode,
             'temp': handle_temp_mode,
             'rain': handle_rain_mode,
@@ -2467,9 +2488,13 @@ class TrafficLightController:
     def _remember_choice(self) -> None:
         # Caller holds the lock.
         self.state.chosen_mode = self.state.target_mode; self.state.chosen_color = self.state.target_manual_color
+        self._save_settings()
+    def _save_settings(self) -> None:
+        # Caller holds the lock.
         try:
             with open(LAST_MODE_FILE, 'w', encoding='utf-8') as f:
-                json.dump({'mode': self.state.chosen_mode, 'color': self.state.chosen_color}, f)
+                json.dump({'mode': self.state.chosen_mode, 'color': self.state.chosen_color,
+                           'chime_volume': self.state.chime_volume, 'chime_volume_on': self.state.chime_volume_on}, f)
         except OSError as e:
             logging.warning(f"Could not save the mode to {LAST_MODE_FILE}: {e}")
     def load_choice(self) -> None:
@@ -2479,6 +2504,12 @@ class TrafficLightController:
         except (OSError, ValueError):
             return
         mode, color = saved.get('mode'), saved.get('color', 'off')
+        if mode == 'westminster':
+            mode = 'clock'  # was a separate Clock sub-mode
+        with self.state.lock:
+            for key in ('chime_volume', 'chime_volume_on'):
+                if isinstance(saved.get(key), (int, float)):
+                    setattr(self.state, key, max(0.0, min(float(saved[key]), 1.0)))
         if (mode in self.mode_handlers or mode in ('manual', 'idle')) and color in LIGHT_STATES:
             with self.state.lock:
                 self.state.chosen_mode, self.state.chosen_color = mode, color
@@ -2486,11 +2517,25 @@ class TrafficLightController:
     def restore_choice(self) -> None:
         # Caller holds the lock.
         self.state.target_mode = self.state.chosen_mode; self.state.target_manual_color = self.state.chosen_color
+    def set_chime_volume(self, volume: Optional[float], preview: bool = False) -> None:
+        """volume 0..1 (0 = mute); None toggles mute. preview rings one bell at the new level."""
+        with self.state.lock:
+            if volume is None:
+                volume = 0.0 if self.state.chime_volume > 0 else self.state.chime_volume_on
+            volume = max(0.0, min(volume, 1.0))
+            self.state.chime_volume = volume
+            if volume > 0:
+                self.state.chime_volume_on = volume
+            self._save_settings()
+            chiming = bool(self.state.mode_state.get('clock_seq'))
+        logging.info(f"Clock volume {round(volume * 100)}%")
+        if preview and volume > 0 and not chiming:
+            play_chime([(CHIME_LATENCY_SECONDS, WESTMINSTER_BELLS[0], 1.0)], volume)
     def test_chime(self, quarter: int, hour12: int) -> None:
         with self.state.lock:
             self.state.mode_state['clock_force'] = (quarter, hour12)
-            if self.state.target_mode not in ('clock', 'westminster'):
-                self.state.target_mode = 'westminster'; self._remember_choice()
+            if self.state.target_mode != 'clock':
+                self.state.target_mode = 'clock'; self._remember_choice()
     def get_status(self) -> Dict:
         with self.state.lock: return self.state.snapshot()
     def run_initialization_sequence(self):
@@ -2530,7 +2575,7 @@ class TrafficLightController:
         logging.info("Controller loop stopped")
     def _transition_to_mode(self, new_mode: str):
         logging.info(f"Transition {self.state.current_mode} -> {new_mode}")
-        stop_chime()  # leaving Westminster mid-chime silences the bells
+        stop_chime()  # leaving Clock mid-chime silences the bells
         self.state.current_mode = new_mode; self.state.last_state_change_time = time()
         if new_mode == 'auto':
             # Start in green so the first visible cycle isn't a 20s red hold.
@@ -2550,7 +2595,7 @@ class TrafficLightController:
             self.state.party_status = {}
             for k in ('party_last_beat', 'party_last_switch'): self.state.mode_state[k] = 0.0
             self.state.mode_state['party_beat_count'] = 0
-        elif new_mode in ('clock', 'westminster'):
+        elif new_mode == 'clock':
             # No last chime yet: the handler chimes the current time right away.
             self.state.mode_state['clock_seq'] = None; self.state.mode_state['clock_last_key'] = None
         elif new_mode == 'idle':

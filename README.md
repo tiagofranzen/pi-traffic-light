@@ -32,15 +32,14 @@ yellow, or green in the end.
 
 ## Modes
 
-Eight tiles on the home screen. Clock, Weather, Commute, Alerts, Party and Racing hold
+Eight tiles on the home screen. Weather, Commute, Alerts, Party and Racing hold
 sub-modes: tap the tile to start the one you used last, then pick another
 from the chips under the light, which also show what each colour means.
 
 | Tile | Sub-mode | Lights up for | Needs |
 |---|---|---|---|
 | Traffic light | | A normal traffic light cycle |, |
-| Clock | Silent | Chimes like an old striking clock: lamps filling up (green, +yellow, +red) or down (red, +yellow, +green), then all off - 1/2/3/4 sweeps at :15/:30/:45/:00, then one yellow blink per hour. Dark between chimes. Quiet 23:00-07:00 |, |
-| | Westminster | The same chimes with Big Ben's Westminster Quarters rung on synthesised bells through a speaker, one four-note change per sweep, and the hour bell with each yellow blink | a speaker |
+| Clock | | Chimes like an old striking clock: lamps filling up (green, +yellow, +red) or down (red, +yellow, +green) and going dark on the fourth note - 1/2/3/4 sweeps at :15/:30/:45/:00, then one yellow blink per hour. With a speaker, the Westminster Quarters (Big Ben's tune) ring along on synthesised bells, hour bell with each blink. The bar next to the light sets the volume, the button under it mutes. Dark between chimes, quiet 23:00-07:00 | a speaker, for the bells |
 | Weather | Temperature | Outside temperature: green 15-26°C, yellow 5-15 or 26-30°C, red beyond |, |
 | | Rain | Rain forecast: green dry for 3 h, yellow rain within 3 h, red raining or within the hour |, |
 | | UV | Current UV index |, |
@@ -92,9 +91,9 @@ in the code: `WEATHER_LAT` / `WEATHER_LON` (defaults to Munich centre),
 `COMMUTE_ORIGIN` / `COMMUTE_DESTINATION` (home and work addresses, for
 Stau and the commute).
 
-Westminster plays through PipeWire, PulseAudio or ALSA, whichever the Pi
-has. `CHIME_VOLUME` (0-1, default 0.5) sets how loud the bells are on top
-of the system volume; `CHIME_PLAYER` picks the player yourself, e.g.
+The Clock bells play through PipeWire, PulseAudio or ALSA, whichever the
+Pi has. `CHIME_VOLUME` (0-1, default 0.5) is the starting volume until you
+set one in the UI; `CHIME_PLAYER` picks the player yourself, e.g.
 `aplay -D plughw:CARD=UC`.
 
 ## Running the SimHub side
@@ -115,6 +114,7 @@ past redline you actually are.
 - `GET /?action=set_mode&mode=<name>`, switch mode
 - `GET /?action=set_color&color=<red|yellow|green>`, manual override
 - `GET /?action=chime&quarter=<1-4>&hour=<1-12>`, ring a Clock chime now to test it (4 = full hour)
+- `GET /?action=set_volume&value=<0-100>` or `&mute=toggle`, Clock bell volume (`&preview=1` rings one bell)
 
 ## License
 
