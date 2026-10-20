@@ -192,8 +192,8 @@ CLOCK_QUIET_HOURS = (23, 7)        # no chimes from 23:00 to 06:59 (relays click
 
 # Westminster (Clock sub-mode) - the same clock, with the Westminster Quarters
 # (Big Ben's tune, 1793) rung on synthesised bells through the speaker. Each
-# sweep is one change of four notes: the lamps join on the first three and the
-# full light holds through the long fourth. :15 = 1 change, :30 = 2, :45 = 3,
+# sweep is one change of four notes: the lamps join on the first three and all
+# go dark on the long fourth. :15 = 1 change, :30 = 2, :45 = 3,
 # :00 = 4, then the hour bell strikes with each yellow blink.
 WESTMINSTER_BELLS = (415.30, 369.99, 329.63, 246.94)   # G#4 F#4 E4 B3
 WESTMINSTER_HOUR_BELL = 164.81                         # E3
@@ -656,7 +656,7 @@ def westminster_sequence(quarter: int, hour12: int) -> Tuple[List[Tuple[str, flo
         lamps = up if i % 2 == 0 else down
         for k, bell in enumerate(WESTMINSTER_CHANGES[change]):
             notes.append((t + k * b, WESTMINSTER_BELLS[bell], 1.0 if k < 3 else 1.15))
-        steps += [(lamps[0], b), (lamps[1], b), (lamps[2], 2 * b), ('off', b)]
+        steps += [(lamps[0], b), (lamps[1], b), (lamps[2], b), ('off', 2 * b)]  # the fourth note puts them out
         t += 5 * b
     if quarter == 4:
         steps.append(('off', WESTMINSTER_HOUR_GAP)); t += WESTMINSTER_HOUR_GAP
@@ -743,7 +743,9 @@ def handle_clock_mode(controller, elapsed: float, bells: bool = False) -> Option
         if idx < len(seq):
             color, dur = seq[idx]
             controller.set_light_state(color)
-            ms['clock_idx'] = idx; ms['clock_step_until'] = now + dur
+            # Each step ends a fixed time after the chime started (not after the previous step
+            # actually switched), so tick delays don't add up and the lamps stay on the bells.
+            ms['clock_idx'] = idx; ms['clock_step_until'] = ms.get('clock_step_until', now) + dur
             return 0.02
         ms['clock_seq'] = None
 
@@ -759,7 +761,7 @@ def handle_clock_mode(controller, elapsed: float, bells: bool = False) -> Option
                 play_chime(notes)  # the light sequence starts right after, in step with the sound
             else:
                 ms['clock_seq'] = clock_chime_sequence(q or 4, dt.hour % 12 or 12)
-            ms['clock_idx'] = -1; ms['clock_step_until'] = 0.0
+            ms['clock_idx'] = -1; ms['clock_step_until'] = time()  # the chime starts now (the bells too)
             return 0.02
     controller.set_light_state('off')
     return 0.2
