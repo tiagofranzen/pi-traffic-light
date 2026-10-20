@@ -114,6 +114,7 @@ past redline you actually are.
 - `GET /events`, same state as an SSE stream (what the UI actually uses)
 - `GET /?action=set_mode&mode=<name>`, switch mode
 - `GET /?action=set_color&color=<red|yellow|green>`, manual override
+- `GET /?action=chime&quarter=<1-4>&hour=<1-12>`, ring a Clock chime now to test it (4 = full hour)
 
 ## License
 

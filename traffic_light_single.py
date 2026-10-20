@@ -694,10 +694,18 @@ def _render_bells(np, notes: List[Tuple[float, float, float]], rate: int = 44100
 
 _chime_proc: Optional[subprocess.Popen] = None
 
-def stop_chime() -> None:
+def stop_chime(wait: bool = True) -> None:
+    """Silences the bells if they're still ringing, and collects the player once it has exited.
+    wait=False only collects a player that has already finished."""
     global _chime_proc
-    if _chime_proc and _chime_proc.poll() is None:
+    if not _chime_proc:
+        return
+    if _chime_proc.poll() is None:
+        if not wait:
+            return
         _chime_proc.terminate()
+        try: _chime_proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired: _chime_proc.kill(); _chime_proc.wait()
     _chime_proc = None
 
 def play_chime(notes: List[Tuple[float, float, float]]) -> None:
@@ -730,11 +738,24 @@ def play_chime(notes: List[Tuple[float, float, float]]) -> None:
     except Exception as e:
         logging.error(f"Westminster: playing the bells failed: {e}")
 
+def _start_clock_chime(ms: Dict, bells: bool, quarter: int, hour12: int) -> None:
+    if bells:
+        ms['clock_seq'], notes = westminster_sequence(quarter, hour12)
+        play_chime(notes)  # the light sequence starts right after, in step with the sound
+    else:
+        ms['clock_seq'] = clock_chime_sequence(quarter, hour12)
+    ms['clock_idx'] = -1; ms['clock_step_until'] = time()  # the chime starts now (the bells too)
+
 def handle_westminster_mode(controller, elapsed: float) -> Optional[float]:
     return handle_clock_mode(controller, elapsed, bells=True)
 
 def handle_clock_mode(controller, elapsed: float, bells: bool = False) -> Optional[float]:
     ms = controller.state.mode_state; now = time(); dt = datetime.now()
+    forced = ms.pop('clock_force', None)  # /?action=chime: ring this one now, to test
+    if forced:
+        ms['clock_last_key'] = (dt.date().isoformat(), dt.hour, dt.minute // 15)  # don't chime the real time on top
+        _start_clock_chime(ms, bells, *forced)
+        return 0.02
     seq = ms.get('clock_seq')
     if seq:
         if now < ms.get('clock_step_until', 0.0):
@@ -748,6 +769,7 @@ def handle_clock_mode(controller, elapsed: float, bells: bool = False) -> Option
             ms['clock_idx'] = idx; ms['clock_step_until'] = ms.get('clock_step_until', now) + dur
             return 0.02
         ms['clock_seq'] = None
+    stop_chime(wait=False)  # the last bells may still be ringing out; collect the player once done
 
     q = dt.minute // 15
     key = (dt.date().isoformat(), dt.hour, q)
@@ -756,12 +778,7 @@ def handle_clock_mode(controller, elapsed: float, bells: bool = False) -> Option
         entering = ms.get('clock_last_key') is None
         ms['clock_last_key'] = key
         if entering or not _clock_quiet(dt.hour):
-            if bells:
-                ms['clock_seq'], notes = westminster_sequence(q or 4, dt.hour % 12 or 12)
-                play_chime(notes)  # the light sequence starts right after, in step with the sound
-            else:
-                ms['clock_seq'] = clock_chime_sequence(q or 4, dt.hour % 12 or 12)
-            ms['clock_idx'] = -1; ms['clock_step_until'] = time()  # the chime starts now (the bells too)
+            _start_clock_chime(ms, bells, q or 4, dt.hour % 12 or 12)
             return 0.02
     controller.set_light_state('off')
     return 0.2
@@ -2335,6 +2352,11 @@ class _Handler(BaseHTTPRequestHandler):
                 elif act=='set_mode':
                     mode = q.get('mode',[''])[0];
                     if mode: self.controller.set_mode(mode)
+                elif act=='chime':
+                    # Test a chime: quarter 1-3 = :15/:30/:45, 4 = full hour; hour 1-12.
+                    quarter = int(q.get('quarter',['4'])[0]); hour = int(q.get('hour',['12'])[0])
+                    if not (1 <= quarter <= 4 and 1 <= hour <= 12): raise ValueError("quarter 1-4, hour 1-12")
+                    self.controller.test_chime(quarter, hour)
                 elif act=='party_record':
                     with self.controller.state.lock: self.controller.state.mode_state['party_record'] = True
                 self.send_response(200); self.end_headers(); return
@@ -2464,6 +2486,11 @@ class TrafficLightController:
     def restore_choice(self) -> None:
         # Caller holds the lock.
         self.state.target_mode = self.state.chosen_mode; self.state.target_manual_color = self.state.chosen_color
+    def test_chime(self, quarter: int, hour12: int) -> None:
+        with self.state.lock:
+            self.state.mode_state['clock_force'] = (quarter, hour12)
+            if self.state.target_mode not in ('clock', 'westminster'):
+                self.state.target_mode = 'westminster'; self._remember_choice()
     def get_status(self) -> Dict:
         with self.state.lock: return self.state.snapshot()
     def run_initialization_sequence(self):
