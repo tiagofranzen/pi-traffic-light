@@ -21,6 +21,10 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, Protocol, List, Tuple
 from datetime import datetime, timedelta
 import random
+import shlex
+import shutil
+import subprocess
+import tempfile
 import socket
 import struct
 import ipaddress
@@ -185,6 +189,22 @@ CLOCK_HOUR_GAP = 1.5               # pause between the last sweep and the first 
 CLOCK_STRIKE_ON = 0.75             # how long each hour strike stays lit
 CLOCK_STRIKE_INTERVAL = 1.5        # strike to strike
 CLOCK_QUIET_HOURS = (23, 7)        # no chimes from 23:00 to 06:59 (relays click)
+
+# Westminster (Clock sub-mode) - the same clock, with the Westminster Quarters
+# (Big Ben's tune, 1793) rung on synthesised bells through the speaker. Each
+# sweep is one change of four notes: the lamps join on the first three and the
+# full light holds through the long fourth. :15 = 1 change, :30 = 2, :45 = 3,
+# :00 = 4, then the hour bell strikes with each yellow blink.
+WESTMINSTER_BELLS = (415.30, 369.99, 329.63, 246.94)   # G#4 F#4 E4 B3
+WESTMINSTER_HOUR_BELL = 164.81                         # E3
+WESTMINSTER_CHANGES = ((0, 1, 2, 3), (2, 0, 1, 3), (2, 1, 0, 2), (0, 2, 1, 3), (3, 1, 0, 2))
+WESTMINSTER_QUARTERS = {1: (0,), 2: (1, 2), 3: (3, 4, 0), 4: (1, 2, 3, 4)}
+WESTMINSTER_BEAT = 0.7             # note to note; the fourth note of a change rings two beats
+WESTMINSTER_HOUR_GAP = 1.5         # after the last change, before the first hour strike
+WESTMINSTER_STRIKE_INTERVAL = 2.2  # hour strike to hour strike
+CHIME_VOLUME = float(os.getenv("CHIME_VOLUME", "0.5"))  # 0..1, on top of the system volume
+CHIME_PLAYER = os.getenv("CHIME_PLAYER", "").strip()    # e.g. "aplay -D plughw:CARD=UC"; default: PipeWire/Pulse/ALSA, whichever is there
+CHIME_LATENCY_SECONDS = 0.12       # the player starts this late; the bells are rung this much earlier
 
 # Location / routes - everything that says where you live or work comes from
 # the environment so it stays out of the repo.
@@ -625,7 +645,95 @@ def clock_chime_sequence(quarter: int, hour12: int) -> List[Tuple[str, float]]:
             seq.append(('off', CLOCK_STRIKE_INTERVAL - CLOCK_STRIKE_ON if i + 1 < hour12 else 1.0))
     return seq
 
-def handle_clock_mode(controller, elapsed: float) -> Optional[float]:
+def westminster_sequence(quarter: int, hour12: int) -> Tuple[List[Tuple[str, float]], List[Tuple[float, float, float]]]:
+    """Light steps and bell notes (start s, Hz, strength) for one chime; quarter 4 = full hour."""
+    b = WESTMINSTER_BEAT; t = 1.0
+    steps: List[Tuple[str, float]] = [('off', t)]
+    notes: List[Tuple[float, float, float]] = []
+    up = ['green', 'green-yellow', 'all_on']
+    down = ['red', 'red_and_yellow', 'all_on']
+    for i, change in enumerate(WESTMINSTER_QUARTERS[quarter]):
+        lamps = up if i % 2 == 0 else down
+        for k, bell in enumerate(WESTMINSTER_CHANGES[change]):
+            notes.append((t + k * b, WESTMINSTER_BELLS[bell], 1.0 if k < 3 else 1.15))
+        steps += [(lamps[0], b), (lamps[1], b), (lamps[2], 2 * b), ('off', b)]
+        t += 5 * b
+    if quarter == 4:
+        steps.append(('off', WESTMINSTER_HOUR_GAP)); t += WESTMINSTER_HOUR_GAP
+        for _ in range(hour12):
+            notes.append((t, WESTMINSTER_HOUR_BELL, 1.4))
+            steps += [('yellow', CLOCK_STRIKE_ON), ('off', WESTMINSTER_STRIKE_INTERVAL - CLOCK_STRIKE_ON)]
+            t += WESTMINSTER_STRIKE_INTERVAL
+    steps.append(('off', 1.0))
+    return steps, notes
+
+# Church-bell partials: (ratio to the strike note, loudness, decay seconds) - hum,
+# prime, minor-third tierce, quint, nominal and a few upper ones.
+_BELL_PARTIALS = ((0.5, 0.25, 3.5), (1.0, 0.55, 2.4), (1.2, 0.30, 1.8), (1.5, 0.18, 1.4),
+                  (2.0, 0.42, 1.1), (2.51, 0.14, 0.7), (3.0, 0.12, 0.5), (4.07, 0.07, 0.3))
+
+_bell_tones: Dict[float, object] = {}  # one synthesised strike per pitch, reused
+
+def _bell_tone(np, freq: float, rate: int):
+    if freq not in _bell_tones:
+        tt = np.arange(int(5.0 * rate)) / rate  # each bell rings for up to 5 s
+        tone = sum(a * np.exp(-tt / tau) * np.sin(2 * np.pi * freq * r * tt + r) for r, a, tau in _BELL_PARTIALS)
+        _bell_tones[freq] = tone * np.minimum(tt / 0.004, 1.0)  # 4 ms strike
+    return _bell_tones[freq]
+
+def _render_bells(np, notes: List[Tuple[float, float, float]], rate: int = 44100):
+    end = max(t for t, _, _ in notes) + 5.0
+    out = np.zeros(int(end * rate), dtype=np.float64)
+    for start, freq, strength in notes:
+        tone = _bell_tone(np, freq, rate)
+        i = max(0, int((start - CHIME_LATENCY_SECONDS) * rate))
+        n = min(len(tone), len(out) - i)
+        out[i:i + n] += tone[:n] * strength
+    peak = float(np.max(np.abs(out))) or 1.0
+    return (out / peak * max(0.0, min(CHIME_VOLUME, 1.0)) * 32767).astype('<i2')
+
+_chime_proc: Optional[subprocess.Popen] = None
+
+def stop_chime() -> None:
+    global _chime_proc
+    if _chime_proc and _chime_proc.poll() is None:
+        _chime_proc.terminate()
+    _chime_proc = None
+
+def play_chime(notes: List[Tuple[float, float, float]]) -> None:
+    """Renders the bells and starts playing them now, in the background."""
+    global _chime_proc
+    import wave
+    try:
+        import numpy as np  # type: ignore
+    except ImportError:
+        logging.warning("Westminster: numpy missing, no bells"); return
+    env = dict(os.environ)
+    if CHIME_PLAYER:
+        cmd = shlex.split(CHIME_PLAYER)
+    else:
+        # The service runs outside the desktop session, so point it at the user's PipeWire/Pulse.
+        runtime = f"/run/user/{os.getuid()}" if hasattr(os, 'getuid') else ''
+        env.setdefault('XDG_RUNTIME_DIR', runtime)
+        if shutil.which('pw-play') and os.path.exists(f"{runtime}/pipewire-0"): cmd = ['pw-play']
+        elif shutil.which('paplay') and os.path.exists(f"{runtime}/pulse/native"): cmd = ['paplay']
+        elif shutil.which('aplay'): cmd = ['aplay', '-q']
+        else:
+            logging.warning("Westminster: no audio player found (pw-play, paplay or aplay)"); return
+    path = os.path.join(tempfile.gettempdir(), 'traffic_light_chime.wav')
+    try:
+        pcm = _render_bells(np, notes)
+        with wave.open(path, 'wb') as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(44100); w.writeframes(pcm.tobytes())
+        stop_chime()
+        _chime_proc = subprocess.Popen(cmd + [path], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        logging.error(f"Westminster: playing the bells failed: {e}")
+
+def handle_westminster_mode(controller, elapsed: float) -> Optional[float]:
+    return handle_clock_mode(controller, elapsed, bells=True)
+
+def handle_clock_mode(controller, elapsed: float, bells: bool = False) -> Optional[float]:
     ms = controller.state.mode_state; now = time(); dt = datetime.now()
     seq = ms.get('clock_seq')
     if seq:
@@ -646,7 +754,11 @@ def handle_clock_mode(controller, elapsed: float) -> Optional[float]:
         entering = ms.get('clock_last_key') is None
         ms['clock_last_key'] = key
         if entering or not _clock_quiet(dt.hour):
-            ms['clock_seq'] = clock_chime_sequence(q or 4, dt.hour % 12 or 12)
+            if bells:
+                ms['clock_seq'], notes = westminster_sequence(q or 4, dt.hour % 12 or 12)
+                play_chime(notes)  # the light sequence starts right after, in step with the sound
+            else:
+                ms['clock_seq'] = clock_chime_sequence(q or 4, dt.hour % 12 or 12)
             ms['clock_idx'] = -1; ms['clock_step_until'] = 0.0
             return 0.02
     controller.set_light_state('off')
@@ -1793,7 +1905,7 @@ _HTML = f"""
             party: {{name: 'Party', modes: ['party', 'audio_vu']}},
             racing: {{name: 'Racing', modes: ['race_start', 'racing', 'hotlap']}},
             gremio: {{name: 'Grêmio', modes: ['gremio']}},
-            clock: {{name: 'Clock', modes: ['clock']}},
+            clock: {{name: 'Clock', modes: ['clock', 'westminster']}},
         }};
         // Sub-mode name and colour ranges (r/y/g/a = red/yellow/green/all), from the Pi's own settings.
         const SUBS = {{
@@ -1809,6 +1921,8 @@ _HTML = f"""
             racing: {{name: 'Revs', rule: [['g', 'shift light'], ['y', 'shift now (green + yellow)'], ['r', 'redline (all)']]}},
             race_start: {{name: 'Start', rule: [['r', 'start lights on'], ['y', 'get ready or yellow flag'], ['g', 'go or green flag']]}},
             hotlap: {{name: 'Hotlap', rule: [['g', 'faster than your best lap'], ['y', 'slower'], ['r', 'lap invalid']]}},
+            clock: {{name: 'Silent', rule: [['a', 'lamp sweeps every 15 min'], ['y', 'one blink per hour']]}},
+            westminster: {{name: 'Westminster', rule: [['a', 'Big Ben quarters on the speaker'], ['y', 'hour bell']]}},
             party: {{name: 'Music', rule: [['a', 'random lamp on every beat'], ['a', 'dark in silence']]}},
             audio_vu: {{name: 'VU meter', rule: [['g', 'quiet'], ['y', 'loud (green + yellow)'], ['r', 'very loud (all)']]}},
         }};
@@ -1849,13 +1963,13 @@ _HTML = f"""
         }}
         // The Pi only pushes status when something changes, so the clock ticks on its own.
         setInterval(() => {{
-            if (currentModeFromServer !== 'clock') return;
+            if (currentModeFromServer !== 'clock' && currentModeFromServer !== 'westminster') return;
             document.querySelector('#modeText strong').innerHTML = clockTitle();
             document.getElementById('info-display').textContent = clockNextChime();
         }}, 1000);
         function modeTitle(mode) {{
             if (mode === 'idle') return 'OFF';
-            if (mode === 'clock') return clockTitle();
+            if (mode === 'clock' || mode === 'westminster') return clockTitle();
             const g = GROUP_OF[mode];
             if (!g) return mode.replace('_', ' ').toUpperCase();
             const name = GROUPS[g].name.toUpperCase();
@@ -2037,7 +2151,7 @@ _HTML = f"""
                 }}
                 else infoDisplay.textContent = `Dry for the next {RAIN_YELLOW_MINUTES // 60} h (max ${{e.rain_prob_max || 0}}%).`;
             }}
-            else if (mode === 'clock') {{
+            else if (mode === 'clock' || mode === 'westminster') {{
                 infoDisplay.textContent = clockNextChime();
             }}
             else if (mode === 'gremio') {{
@@ -2256,6 +2370,7 @@ class TrafficLightController:
             'uv': handle_uv_mode,
             'gremio': handle_gremio_mode,
             'clock': handle_clock_mode,
+            'westminster': handle_westminster_mode,
             'audio_vu': handle_audio_vu_mode,
             'temp': handle_temp_mode,
             'rain': handle_rain_mode,
@@ -2386,6 +2501,7 @@ class TrafficLightController:
         logging.info("Controller loop stopped")
     def _transition_to_mode(self, new_mode: str):
         logging.info(f"Transition {self.state.current_mode} -> {new_mode}")
+        stop_chime()  # leaving Westminster mid-chime silences the bells
         self.state.current_mode = new_mode; self.state.last_state_change_time = time()
         if new_mode == 'auto':
             # Start in green so the first visible cycle isn't a 20s red hold.
@@ -2405,7 +2521,7 @@ class TrafficLightController:
             self.state.party_status = {}
             for k in ('party_last_beat', 'party_last_switch'): self.state.mode_state[k] = 0.0
             self.state.mode_state['party_beat_count'] = 0
-        elif new_mode == 'clock':
+        elif new_mode in ('clock', 'westminster'):
             # No last chime yet: the handler chimes the current time right away.
             self.state.mode_state['clock_seq'] = None; self.state.mode_state['clock_last_key'] = None
         elif new_mode == 'idle':
