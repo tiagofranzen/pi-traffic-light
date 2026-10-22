@@ -24,7 +24,7 @@ const SUBS = {
     emergency: {name: 'Blinking', rule: [['y', `blinks every ${CFG.blink_seconds} s`]]},
     sos: {name: 'SOS', rule: [['a', 'Morse SOS on all lamps']]},
     racing: {name: 'Revs', rule: [['g', 'shift light'], ['y', 'shift now (green + yellow)'], ['r', 'redline (all)']]},
-    race_start: {name: 'Start', rule: [['r', 'start lights on'], ['y', 'get ready or yellow flag'], ['g', 'go or green flag']]},
+    race_start: {name: 'Start', rule: [['a', 'F1 start: 3 lights + beeps, then lights out'], ['y', 'yellow flag'], ['g', 'green flag']]},
     hotlap: {name: 'Hotlap', rule: [['g', 'faster than your best lap'], ['y', 'slower'], ['r', 'lap invalid']]},
     party: {name: 'Music', rule: [['a', 'random lamp on every beat'], ['a', 'dark in silence']]},
     audio_vu: {name: 'VU meter', rule: [['g', 'quiet'], ['y', 'loud (green + yellow)'], ['r', 'very loud (all)']]},
@@ -219,8 +219,15 @@ function updateVisuals(color, mode, s_bahn_minutes, race_step, space_weather, tr
         else { infoDisplay.textContent = 'No weather data.'; }
     }
     else if (mode === 'race_start') {
-        const names = {red: 'Start lights on', yellow: 'Get ready / yellow flag', green: 'Go! / green flag', black: 'No start or flag right now'};
-        infoDisplay.textContent = lastStatus.simhub_live ? (names[lastStatus.simhub_flag] || '') : 'Waiting for SimHub…';
+        const steps = ['Grid ready…', 'Lights on · ● ○ ○', 'Lights on · ● ● ○', 'Lights on · ● ● ●', 'Lights out and away we go!'];
+        if (race_step < 5) {
+            infoDisplay.textContent = steps[race_step] || '';
+        } else if (lastStatus.simhub_live) {
+            const names = {red: 'Start lights on', yellow: 'Yellow flag', green: 'Green flag', black: 'Track clear'};
+            infoDisplay.textContent = names[lastStatus.simhub_flag] || '';
+        } else {
+            infoDisplay.textContent = 'Lights out! Tap Start to run again.';
+        }
     }
     else if (mode === 'hotlap') {
         const d = lastStatus.simhub_delta;
@@ -384,7 +391,11 @@ function handleGroupClick(g) {
     handleModeClick(mode);
 }
 function selectSub(mode) {
-    if (mode !== currentModeFromServer) handleModeClick(mode);
+    if (mode === 'race_start' && currentModeFromServer === 'race_start') {
+        sendAction('/?action=race_start');
+    } else if (mode !== currentModeFromServer) {
+        handleModeClick(mode);
+    }
 }
 function setConnected(ok) {
     const pill = document.getElementById('connPill');

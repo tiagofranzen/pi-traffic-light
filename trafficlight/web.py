@@ -84,6 +84,8 @@ class _Handler(BaseHTTPRequestHandler):
                     quarter = int(q.get('quarter',['4'])[0]); hour = int(q.get('hour',['12'])[0])
                     if not (1 <= quarter <= 4 and 1 <= hour <= 12): raise ValueError("quarter 1-4, hour 1-12")
                     self.controller.test_chime(quarter, hour)
+                elif act=='race_start':
+                    self.controller.trigger_race_start()
                 elif act=='party_record':
                     with self.controller.state.lock: self.controller.state.mode_state['party_record'] = True
                 self.send_response(200); self.end_headers(); return

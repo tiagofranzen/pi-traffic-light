@@ -65,7 +65,7 @@ class SharedState:
             'mode': self.current_mode,
             's_bahn_minutes': self.s_bahn_minutes_away,
             's_bahn_transit': self.s_bahn_transit_status.copy(),
-            'race_step': 0 if self.mode_state.get('intro_seq') else 4,  # the web UI waits for the intro to finish
+            'race_step': max(0, int(self.mode_state.get('intro_idx', 0))) if self.mode_state.get('intro_seq') else 5,
             'simhub_rev_pct': self.simhub_rev_pct,
             'simhub_delta': self.simhub_delta,
             'simhub_lap_invalid': self.simhub_lap_invalid,

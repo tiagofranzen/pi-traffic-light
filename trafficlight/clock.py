@@ -105,17 +105,11 @@ def stop_chime(wait: bool = True) -> None:
             except subprocess.TimeoutExpired: _chime_proc.kill(); _chime_proc.wait()
         _chime_proc = None
 
-def play_chime(notes: List[Tuple[float, float, float]], volume: float) -> None:
-    """Renders the bells and starts playing them now, in the background. Volume 0 = muted."""
+def play_pcm(pcm, rate: int = 44100) -> None:
+    """Writes a 16-bit mono PCM array to a WAV file and plays it in the background."""
     global _chime_proc
     stop_chime()
-    if volume <= 0:
-        return
     import wave
-    try:
-        import numpy as np  # type: ignore
-    except ImportError:
-        logging.warning("Clock: numpy missing, no bells"); return
     env = dict(os.environ)
     uid = os.getuid() if hasattr(os, 'getuid') else 0
     runtime = f"/run/user/{uid}" if uid else ''
@@ -132,13 +126,23 @@ def play_chime(notes: List[Tuple[float, float, float]], volume: float) -> None:
     wav_dir = runtime if (runtime and os.path.isdir(runtime)) else tempfile.gettempdir()
     path = os.path.join(wav_dir, f'traffic_light_chime_{uid}.wav')
     try:
-        pcm = _render_bells(np, notes, volume)
         with _chime_lock:
             with wave.open(path, 'wb') as w:
-                w.setnchannels(1); w.setsampwidth(2); w.setframerate(44100); w.writeframes(pcm.tobytes())
+                w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate); w.writeframes(pcm.tobytes())
             _chime_proc = subprocess.Popen(cmd + [path], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as e:
-        logging.error(f"Clock: playing the bells failed: {e}")
+        logging.error(f"Clock: playing audio failed: {e}")
+
+def play_chime(notes: List[Tuple[float, float, float]], volume: float) -> None:
+    """Renders the bells and starts playing them now, in the background. Volume 0 = muted."""
+    stop_chime()
+    if volume <= 0:
+        return
+    try:
+        import numpy as np  # type: ignore
+    except ImportError:
+        logging.warning("Clock: numpy missing, no bells"); return
+    play_pcm(_render_bells(np, notes, volume))
 
 def _start_clock_chime(controller, quarter: int, hour12: int) -> None:
     ms = controller.state.mode_state

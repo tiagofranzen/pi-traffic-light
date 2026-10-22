@@ -179,6 +179,12 @@ class TrafficLightController:
             if self.state.target_mode != 'clock':
                 self.state.target_mode = 'clock'; self._remember_choice()
         self._wake.set()
+    def trigger_race_start(self) -> None:
+        with self.state.lock:
+            self.state.mode_state['race_start_force'] = True
+            if self.state.target_mode != 'race_start':
+                self.state.target_mode = 'race_start'; self._remember_choice()
+        self._wake.set()
     def get_status(self) -> Dict:
         with self.state.lock: return self.state.snapshot()
     def run_initialization_sequence(self):
@@ -228,6 +234,8 @@ class TrafficLightController:
             self.state.mode_state['sos_index'] = 0
             # Apply the first pattern step on entry; handler advances after its duration.
             self.set_light_state(self.state.mode_state['sos_pattern'][0]['state'])
+        elif new_mode == 'race_start':
+            self.state.mode_state.update(race_start_force=True, race_prev_flag='black', intro_seq=None)
         elif new_mode in RACING_INTROS:
             self.state.mode_state.update(intro_seq=RACING_INTROS[new_mode], intro_idx=-1, intro_until=0.0)
         elif new_mode == 'audio_vu':
