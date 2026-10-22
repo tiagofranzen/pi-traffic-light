@@ -2,7 +2,7 @@
 from __future__ import annotations
 import os
 import logging
-from time import time, sleep
+from time import time
 from datetime import datetime, timedelta
 import xml.etree.ElementTree as ET
 from typing import Dict, List, Optional, Tuple

@@ -1,7 +1,6 @@
 """The controller loop that runs the modes, and the program start."""
 from __future__ import annotations
 import os
-import sys
 import signal
 import logging
 import tempfile

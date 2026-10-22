@@ -4,7 +4,7 @@ import threading
 import requests
 import os
 import logging
-from time import time, sleep
+from time import time
 import socket
 import struct
 import ipaddress

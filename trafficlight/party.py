@@ -4,7 +4,7 @@ import os
 import logging
 import math
 from collections import deque
-from time import time, sleep
+from time import time
 from datetime import datetime
 import random
 from typing import Dict, List, Optional, Tuple
