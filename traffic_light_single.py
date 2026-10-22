@@ -644,21 +644,26 @@ def westminster_sequence(quarter: int, hour12: int) -> Tuple[List[Tuple[str, flo
     return steps, notes
 
 # Church-bell partials: (ratio to the strike note, loudness, decay seconds) - hum,
-# prime, minor-third tierce, quint, nominal and a few upper ones.
-_BELL_PARTIALS = ((0.5, 0.25, 3.5), (1.0, 0.55, 2.4), (1.2, 0.30, 1.8), (1.5, 0.18, 1.4),
-                  (2.0, 0.42, 1.1), (2.51, 0.14, 0.7), (3.0, 0.12, 0.5), (4.07, 0.07, 0.3))
+# prime, minor-third tierce, quint, nominal and a few upper ones. Like a real bell,
+# the low hum rings on long after the bright strike tones have died away.
+_BELL_PARTIALS = ((0.5, 0.25, 6.0), (1.0, 0.55, 4.0), (1.2, 0.30, 3.0), (1.5, 0.18, 2.2),
+                  (2.0, 0.42, 1.8), (2.51, 0.14, 1.0), (3.0, 0.12, 0.7), (4.07, 0.07, 0.4))
+BELL_RING_SECONDS = 12.0   # each strike is rendered this long...
+BELL_FADE_SECONDS = 4.0    # ...and eased to silence over its last seconds, so nothing is cut off
 
 _bell_tones: Dict[float, object] = {}  # one synthesised strike per pitch, reused
 
 def _bell_tone(np, freq: float, rate: int):
     if freq not in _bell_tones:
-        tt = np.arange(int(5.0 * rate)) / rate  # each bell rings for up to 5 s
+        tt = np.arange(int(BELL_RING_SECONDS * rate)) / rate
         tone = sum(a * np.exp(-tt / tau) * np.sin(2 * np.pi * freq * r * tt + r) for r, a, tau in _BELL_PARTIALS)
-        _bell_tones[freq] = tone * np.minimum(tt / 0.004, 1.0)  # 4 ms strike
+        fade = np.clip((BELL_RING_SECONDS - tt) / BELL_FADE_SECONDS, 0.0, 1.0)
+        tone *= np.minimum(tt / 0.004, 1.0) * np.sin(fade * np.pi / 2) ** 2  # 4 ms strike, smooth tail to zero
+        _bell_tones[freq] = tone
     return _bell_tones[freq]
 
 def _render_bells(np, notes: List[Tuple[float, float, float]], volume: float, rate: int = 44100):
-    end = max(t for t, _, _ in notes) + 5.0
+    end = max(t for t, _, _ in notes) + BELL_RING_SECONDS  # the last bell rings out completely
     out = np.zeros(int(end * rate), dtype=np.float64)
     for start, freq, strength in notes:
         tone = _bell_tone(np, freq, rate)
