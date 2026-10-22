@@ -49,17 +49,20 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header('Connection', 'keep-alive')
         self.end_headers()
         seen = -1
+        _status_feed.subscribe(self.controller)
         try:
             while self.controller.state.running:
                 # Sleeps until the status changes; a keepalive now and then, so an idle phone's radio can sleep.
                 version, payload = _status_feed.wait_newer(seen, SSE_KEEPALIVE_SECONDS)
-                if version == seen:
+                if version == seen or not payload:
                     self.wfile.write(b": ping\n\n")
                 else:
                     self.wfile.write(f"data: {payload}\n\n".encode()); seen = version
                 self.wfile.flush()
         except OSError:  # browser gone: broken pipe, reset, timeout
             pass
+        finally:
+            _status_feed.unsubscribe()
     def _index(self,p):
         q = parse_qs(p.query); act = q.get('action',[None])[0]
         if act:
@@ -110,11 +113,29 @@ class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 
 class _StatusFeed:
     """Builds the status once every 50 ms for all browsers (instead of once per browser)
-    and wakes the event streams only when it changed."""
+    while at least one browser is connected, and wakes the event streams only when it changed."""
     def __init__(self):
-        self.cond = threading.Condition(); self.version = 0; self.payload = ''
+        self.cond = threading.Condition()
+        self.has_clients = threading.Event()
+        self.clients = 0
+        self.version = 0
+        self.payload = ''
+    def subscribe(self, controller: TrafficLightController) -> None:
+        payload = json.dumps(controller.get_status())
+        with self.cond:
+            if payload != self.payload:
+                self.payload = payload; self.version += 1; self.cond.notify_all()
+            self.clients += 1
+            self.has_clients.set()
+    def unsubscribe(self) -> None:
+        with self.cond:
+            self.clients = max(0, self.clients - 1)
+            if self.clients == 0:
+                self.has_clients.clear()
     def run(self, controller: TrafficLightController) -> None:
         while controller.state.running:
+            if not self.has_clients.wait(timeout=1.0):
+                continue
             payload = json.dumps(controller.get_status())
             if payload != self.payload:
                 with self.cond:

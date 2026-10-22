@@ -44,7 +44,7 @@ def _poll(controller, name: str, fetch, interval: float, store) -> None:
                 logging.warning(f"{name}: no fresh data for {now - last_ok:.0f} s, dropped")
             wait = min(retry, interval); retry = min(retry * 2, interval)
             logging.info(f"{name}: no data, retrying in {wait:.0f} s")
-        sleep(wait)
+        controller._stop.wait(timeout=wait)
 
 def _get_interface_ipv4(ifname: str) -> Optional[str]:
     """Return IPv4 address for an interface (Linux), or None."""
@@ -113,4 +113,5 @@ def network_monitor(controller):
                     controller.state.target_mode = 'auto'
                     logging.info("Network down -> target auto")
                 prev = connected
-        sleep(NETWORK_POLL_INTERVAL)
+                controller._wake.set()
+        controller._stop.wait(timeout=NETWORK_POLL_INTERVAL)

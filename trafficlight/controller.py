@@ -1,8 +1,10 @@
 """The controller loop that runs the modes, and the program start."""
 from __future__ import annotations
+import os
 import sys
 import signal
 import logging
+import tempfile
 import threading
 from time import time, sleep
 import json
@@ -23,6 +25,8 @@ from .web import _start_web
 class TrafficLightController:
     def __init__(self, use_mock_hardware: bool = False):
         self.state = SharedState()
+        self._wake = threading.Event()
+        self._stop = threading.Event()
         self.hardware = self._init_hardware(use_mock_hardware)
         self.mode_handlers = {
             'auto': handle_auto_mode,
@@ -98,6 +102,7 @@ class TrafficLightController:
             else:
                 self.state.target_mode = mode; logging.info(f"Switch to mode {mode}")
             self._remember_choice()
+        self._wake.set()
     def set_manual_color(self, color: str) -> None:
         if color not in LIGHT_STATES:
             raise ValueError(f"unknown color {color!r}")
@@ -108,16 +113,30 @@ class TrafficLightController:
                 self.state.target_manual_color = color
             self.state.target_mode = 'manual'; logging.info(f"Manual color {color}")
             self._remember_choice()
+        self._wake.set()
     def _remember_choice(self) -> None:
         # Caller holds the lock.
         self.state.chosen_mode = self.state.target_mode; self.state.chosen_color = self.state.target_manual_color
         self._save_settings()
     def _save_settings(self) -> None:
         # Caller holds the lock.
+        payload = {
+            'mode': self.state.chosen_mode,
+            'color': self.state.chosen_color,
+            'chime_volume': self.state.chime_volume,
+            'chime_volume_on': self.state.chime_volume_on,
+        }
         try:
-            with open(LAST_MODE_FILE, 'w', encoding='utf-8') as f:
-                json.dump({'mode': self.state.chosen_mode, 'color': self.state.chosen_color,
-                           'chime_volume': self.state.chime_volume, 'chime_volume_on': self.state.chime_volume_on}, f)
+            target_dir = os.path.dirname(os.path.abspath(LAST_MODE_FILE)) or "."
+            fd, tmp_path = tempfile.mkstemp(prefix=".tl_mode_", suffix=".tmp", dir=target_dir)
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    json.dump(payload, f)
+                os.replace(tmp_path, LAST_MODE_FILE)
+            except Exception:
+                try: os.unlink(tmp_path)
+                except OSError: pass
+                raise
         except OSError as e:
             logging.warning(f"Could not save the mode to {LAST_MODE_FILE}: {e}")
     def load_choice(self) -> None:
@@ -159,6 +178,7 @@ class TrafficLightController:
             self.state.mode_state['clock_force'] = (quarter, hour12)
             if self.state.target_mode != 'clock':
                 self.state.target_mode = 'clock'; self._remember_choice()
+        self._wake.set()
     def get_status(self) -> Dict:
         with self.state.lock: return self.state.snapshot()
     def run_initialization_sequence(self):
@@ -179,6 +199,7 @@ class TrafficLightController:
                 self.set_light_state('green')
             self.state.last_state_change_time = time()
         while self.state.running:
+            self._wake.clear()
             slp = CONTROLLER_LOOP_SLEEP
             with self.state.lock:
                 if self.state.current_mode != self.state.target_mode:
@@ -194,7 +215,7 @@ class TrafficLightController:
                 cs = handler(self, elapsed)
                 if cs is not None:
                     slp = cs
-            sleep(slp)
+            self._wake.wait(timeout=slp)
         logging.info("Controller loop stopped")
     def _transition_to_mode(self, new_mode: str):
         logging.info(f"Transition {self.state.current_mode} -> {new_mode}")
@@ -225,10 +246,13 @@ class TrafficLightController:
             self.set_light_state('off')
     def shutdown(self):
         logging.info("Shutdown initiated")
+        stop_chime()
         # Under the lock, so no handler is mid-switch; set_light_state refuses once running is off.
         with self.state.lock:
             self.state.running = False
             self.hardware.cleanup()
+        self._stop.set()
+        self._wake.set()
         logging.info("Shutdown complete")
 
 def main():
@@ -255,9 +279,10 @@ def main():
         ctrl.run_initialization_sequence()
     except Exception as e:
         logging.error(f"Init sequence error: {e}")
+    stop_event = threading.Event()
     def _sig(sig, frame):
         logging.info(f"Signal {sig} received")
-        ctrl.shutdown(); sys.exit(0)
+        stop_event.set()
     signal.signal(signal.SIGINT, _sig); signal.signal(signal.SIGTERM, _sig)
     threads = [
         threading.Thread(target=ctrl.run, name='controller', daemon=True),
@@ -272,6 +297,14 @@ def main():
         threading.Thread(target=gremio_monitor, args=(ctrl,), name='gremio', daemon=True),
         threading.Thread(target=_start_web, args=(ctrl,), name='web', daemon=True),  # web blocks; daemon so shutdown doesn't hang
     ]
-    for t in threads[:-1]: t.start(); logging.info(f"Started thread {t.name}")
-    threads[-1].start()  # start web last (blocking)
-    threads[-1].join()
+    for t in threads:
+        t.start(); logging.info(f"Started thread {t.name}")
+    try:
+        while not stop_event.is_set():
+            stop_event.wait(timeout=1.0)
+    except KeyboardInterrupt:
+        pass
+    ctrl.shutdown()
+    for t in threads:
+        if t.name in ('controller', 'audio') and t.is_alive():
+            t.join(timeout=2.0)

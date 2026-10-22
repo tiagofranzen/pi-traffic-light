@@ -8,6 +8,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 from typing import Dict, List, Optional, Tuple
 
 # Clock mode - quarter chimes like an old striking clock, as sweeps along the
@@ -87,20 +88,22 @@ def _render_bells(np, notes: List[Tuple[float, float, float]], volume: float, ra
     return (out / peak * max(0.0, min(volume, 1.0)) * 32767).astype('<i2')
 
 _chime_proc: Optional[subprocess.Popen] = None
+_chime_lock = threading.Lock()
 
 def stop_chime(wait: bool = True) -> None:
     """Silences the bells if they're still ringing, and collects the player once it has exited.
     wait=False only collects a player that has already finished."""
     global _chime_proc
-    if not _chime_proc:
-        return
-    if _chime_proc.poll() is None:
-        if not wait:
+    with _chime_lock:
+        if not _chime_proc:
             return
-        _chime_proc.terminate()
-        try: _chime_proc.wait(timeout=1.0)
-        except subprocess.TimeoutExpired: _chime_proc.kill(); _chime_proc.wait()
-    _chime_proc = None
+        if _chime_proc.poll() is None:
+            if not wait:
+                return
+            _chime_proc.terminate()
+            try: _chime_proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired: _chime_proc.kill(); _chime_proc.wait()
+        _chime_proc = None
 
 def play_chime(notes: List[Tuple[float, float, float]], volume: float) -> None:
     """Renders the bells and starts playing them now, in the background. Volume 0 = muted."""
@@ -114,23 +117,26 @@ def play_chime(notes: List[Tuple[float, float, float]], volume: float) -> None:
     except ImportError:
         logging.warning("Clock: numpy missing, no bells"); return
     env = dict(os.environ)
+    uid = os.getuid() if hasattr(os, 'getuid') else 0
+    runtime = f"/run/user/{uid}" if uid else ''
     if CHIME_PLAYER:
         cmd = shlex.split(CHIME_PLAYER)
     else:
         # The service runs outside the desktop session, so point it at the user's PipeWire/Pulse.
-        runtime = f"/run/user/{os.getuid()}" if hasattr(os, 'getuid') else ''
         env.setdefault('XDG_RUNTIME_DIR', runtime)
         if shutil.which('pw-play') and os.path.exists(f"{runtime}/pipewire-0"): cmd = ['pw-play']
         elif shutil.which('paplay') and os.path.exists(f"{runtime}/pulse/native"): cmd = ['paplay']
         elif shutil.which('aplay'): cmd = ['aplay', '-q']
         else:
             logging.warning("Clock: no audio player found (pw-play, paplay or aplay)"); return
-    path = os.path.join(tempfile.gettempdir(), 'traffic_light_chime.wav')
+    wav_dir = runtime if (runtime and os.path.isdir(runtime)) else tempfile.gettempdir()
+    path = os.path.join(wav_dir, f'traffic_light_chime_{uid}.wav')
     try:
         pcm = _render_bells(np, notes, volume)
-        with wave.open(path, 'wb') as w:
-            w.setnchannels(1); w.setsampwidth(2); w.setframerate(44100); w.writeframes(pcm.tobytes())
-        _chime_proc = subprocess.Popen(cmd + [path], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with _chime_lock:
+            with wave.open(path, 'wb') as w:
+                w.setnchannels(1); w.setsampwidth(2); w.setframerate(44100); w.writeframes(pcm.tobytes())
+            _chime_proc = subprocess.Popen(cmd + [path], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as e:
         logging.error(f"Clock: playing the bells failed: {e}")
 

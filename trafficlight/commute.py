@@ -131,7 +131,7 @@ def s_bahn_monitor(controller):
         upcoming = [int((d - now).total_seconds() / 60) for d in departures if d >= now]
         with controller.state.lock:
             controller.state.s_bahn_minutes_away = min(upcoming) if upcoming else -1
-        sleep(S_BAHN_POLL_INTERVAL)
+        controller._stop.wait(timeout=S_BAHN_POLL_INTERVAL)
 
 def _commute_route() -> Optional[dict]:
     for route in TRAFFIC_ROUTES:

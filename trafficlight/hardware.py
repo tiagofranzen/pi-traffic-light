@@ -5,6 +5,15 @@ from typing import List, Protocol
 from .config import ACTIVE_HIGH, GREEN_PIN, RED_PIN, YELLOW_PIN
 
 LIGHT_STATES = ('off', 'red', 'yellow', 'green', 'red_and_yellow', 'green-yellow', 'all_on')
+_STATE_MAP = {
+    'off':            (False, False, False),
+    'red':            (True,  False, False),
+    'yellow':         (False, True,  False),
+    'green':          (False, False, True),
+    'red_and_yellow': (True,  True,  False),
+    'green-yellow':   (False, True,  True),
+    'all_on':         (True,  True,  True),
+}
 
 class LEDInterface(Protocol):
     def on(self) -> None: ...
@@ -42,18 +51,22 @@ class LightHardware:
                 except Exception: pass
             raise
         self.all_lights: List[LEDInterface] = [self.red, self.yellow, self.green]
+        self._active_tuple = (False, False, False)
     def set_state(self, color: str) -> None:
-        for l in self.all_lights: l.off()
-        if color == "red": self.red.on()
-        elif color == "yellow": self.yellow.on()
-        elif color == "green": self.green.on()
-        elif color == "red_and_yellow": self.red.on(); self.yellow.on()
-        elif color == "all_on": self.red.on(); self.yellow.on(); self.green.on()
-        elif color == "green-yellow": self.green.on(); self.yellow.on()
+        target = _STATE_MAP.get(color, (False, False, False))
+        for led, was_on, want_on in zip(self.all_lights, self._active_tuple, target):
+            if was_on and not want_on:
+                led.off()
+        for led, was_on, want_on in zip(self.all_lights, self._active_tuple, target):
+            if not was_on and want_on:
+                led.on()
+        self._active_tuple = target
     def all_off(self) -> None:
         for l in self.all_lights: l.off()
+        self._active_tuple = (False, False, False)
     def test_sequence(self, duration: float = 0.15) -> None:
         for l in self.all_lights: l.on(); sleep(duration); l.off()
+        self._active_tuple = (False, False, False)
     def cleanup(self) -> None:
         # The pins belong to gpiozero, so it releases them (RPi.GPIO doesn't know them, and doesn't work on a Pi 5).
         for led in self.all_lights:

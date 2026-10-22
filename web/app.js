@@ -1,6 +1,6 @@
 // Web UI for the traffic light. Settings that live in Python come in as window.TL_CONFIG.
 const CFG = window.TL_CONFIG;
-let currentModeFromServer = 'unknown'; let localAnimationId = null;
+let currentModeFromServer = 'unknown';
 // Tiles are groups; the Pi only knows the flat modes inside them.
 const GROUPS = {
     auto: {name: 'Traffic light', modes: ['auto']},
@@ -55,10 +55,11 @@ const pad2 = n => n.toString().padStart(2, '0');
 function clockNextChime() {
     const d = new Date();
     const next = new Date(d); next.setMinutes((Math.floor(d.getMinutes() / 15) + 1) * 15, 0, 0);
-    const h12 = next.getHours() % 12 || 12;
+    const h = next.getHours(), h12 = h % 12 || 12;
     const n = next.getMinutes() === 0 ? `4 sweeps + ${h12} blink${h12 === 1 ? '' : 's'}` : `${next.getMinutes() / 15} sweep${next.getMinutes() === 15 ? '' : 's'}`;
-    const quiet = next.getHours() >= CFG.quiet_hours[0] || next.getHours() < CFG.quiet_hours[1];
-    return `Next: ${pad2(next.getHours())}:${pad2(next.getMinutes())} · ${quiet ? 'quiet hours' : n}`;
+    const [qs, qe] = CFG.quiet_hours;
+    const quiet = qs > qe ? (h >= qs || h < qe) : (h >= qs && h < qe);
+    return `Next: ${pad2(h)}:${pad2(next.getMinutes())} · ${quiet ? 'quiet hours' : n}`;
 }
 function clockTitle() {
     const d = new Date();
@@ -147,10 +148,12 @@ function showVolume(v) {
 function volumeAt(ev) {
     const r = document.getElementById('ledStrip').getBoundingClientRect();
     const f = 1 - (ev.clientY - r.top) / r.height;
+    if (f <= 0.04) return 0;
     return Math.max(1, Math.min(LED_SEGMENTS.length, Math.ceil(f * LED_SEGMENTS.length))) / LED_SEGMENTS.length;
 }
-function sendVolume(v) { fetch(`/?action=set_volume&value=${Math.round(v * 100)}&preview=1`); }
-function toggleMute() { fetch('/?action=set_volume&mute=toggle&preview=1'); }
+function sendAction(url) { fetch(url).catch(() => setConnected(false)); }
+function sendVolume(v) { sendAction(`/?action=set_volume&value=${Math.round(v * 100)}&preview=1`); }
+function toggleMute() { sendAction('/?action=set_volume&mute=toggle&preview=1'); }
 (() => {
     const strip = document.getElementById('ledStrip');
     strip.addEventListener('pointerdown', ev => {
@@ -364,32 +367,13 @@ function updateVisuals(color, mode, s_bahn_minutes, race_step, space_weather, tr
         gremioStars.classList.remove('visible');
     }
 }
-function stopLocalAnimation() { if (localAnimationId) { clearInterval(localAnimationId); clearTimeout(localAnimationId); localAnimationId = null; } }
-function startSosAnimation() {
-    stopLocalAnimation();
-    const sosPattern = [
-        {state: 'all_on', duration: 200}, {state: 'off', duration: 200},{state: 'all_on', duration: 200}, {state: 'off', duration: 200},{state: 'all_on', duration: 200}, {state: 'off', duration: 400},
-        {state: 'all_on', duration: 600}, {state: 'off', duration: 200},{state: 'all_on', duration: 600}, {state: 'off', duration: 200},{state: 'all_on', duration: 600}, {state: 'off', duration: 400},
-        {state: 'all_on', duration: 200}, {state: 'off', duration: 200},{state: 'all_on', 'duration': 200}, {state: 'off', duration: 200},{state: 'all_on', duration: 200}, {state: 'off', duration: 1500},
-    ];
-    let sosIndex = 0;
-    function runSosStep() {
-        if (currentModeFromServer !== 'sos') return;
-        const step = sosPattern[sosIndex]; updateVisuals(step.state, 'sos', -1, 0, {}, {}, {}, {}, {}, {});
-        sosIndex = (sosIndex + 1) % sosPattern.length;
-        localAnimationId = setTimeout(runSosStep, step.duration);
-    }
-    runSosStep();
-}
-function handleLightClick(color) { stopLocalAnimation(); fetch(`/?action=set_color&color=${color}`); }
+function handleLightClick(color) { sendAction(`/?action=set_color&color=${color}`); }
 let lastModeClickTime = 0;
 function handleModeClick(mode) {
     const now = Date.now();
     if (now - lastModeClickTime < 400) return;
     lastModeClickTime = now;
-    const isTogglingOff = currentModeFromServer === mode;
-    stopLocalAnimation(); fetch(`/?action=set_mode&mode=${mode}`);
-    if (!isTogglingOff && mode === 'sos') startSosAnimation();
+    sendAction(`/?action=set_mode&mode=${mode}`);
 }
 function handleGroupClick(g) {
     // Tapping the active group turns it off (the Pi toggles a mode set twice);
@@ -411,7 +395,6 @@ function setConnected(ok) {
 let lastStatus = {};
 function applyStatus(status) {
     lastStatus = status;
-    if (localAnimationId) return;
     updateVisuals(status.color, status.mode, status.s_bahn_minutes, status.race_step, status.space_weather, status.traffic, status.party, status.s_bahn_transit, status.environment, status.gremio, status.simhub_rev_pct, status.audio_level);
 }
 let eventSource = null;

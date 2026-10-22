@@ -537,7 +537,9 @@ def audio_monitor(controller):
             if not active:
                 tracker.reset(); active = True; recent.clear()
             recent.append(samples.copy())
-            if controller.state.mode_state.pop('party_record', False):
+            with controller.state.lock:
+                do_record = controller.state.mode_state.pop('party_record', False)
+            if do_record:
                 _save_party_recording(np, recent, samplerate)
             try:
                 tracker.process(samples, now, mask_mid=click)
@@ -588,7 +590,9 @@ def audio_monitor(controller):
             with controller.state.lock:
                 controller.state.party_status = {}
             logging.info(f"Audio: looking for the mic again in {retry:.0f} s")
-            sleep(retry); retry = min(retry * 2, AUDIO_RETRY_MAX_SECONDS)
+            if controller._stop.wait(timeout=retry):
+                break
+            retry = min(retry * 2, AUDIO_RETRY_MAX_SECONDS)
             try:  # PortAudio only sees a re-plugged device after a rescan
                 sd._terminate(); sd._initialize()
             except Exception:

@@ -1,6 +1,7 @@
-﻿using SimHub.Plugins;
+using SimHub.Plugins;
 using System;
 using System.Globalization;
+using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
@@ -26,6 +27,10 @@ namespace SimHub.Plugins.TrafficLight
         private bool _initSequenceComplete = false;
         private readonly UdpClient _udp = new UdpClient();
         private DateTime _lastStatusUpdate = DateTime.MinValue;
+        private DateTime _lastErrorLog = DateTime.MinValue;
+        private IPEndPoint _cachedEndpoint;
+        private string _cachedIp;
+        private int _cachedPort;
 
         // Hotlap (iRacing): the current lap stays invalid from the first infraction until the next lap starts.
         private int _lapNumber = -1;
@@ -192,12 +197,36 @@ namespace SimHub.Plugins.TrafficLight
             {
                 // One socket for the plugin's lifetime; sending ~60 packets a second, a new client per packet adds up.
                 byte[] dataBytes = Encoding.UTF8.GetBytes(message);
-                _udp.Send(dataBytes, dataBytes.Length, Settings.UdpIpAddress, Settings.UdpPort);
+                if (_cachedEndpoint == null || _cachedIp != Settings.UdpIpAddress || _cachedPort != Settings.UdpPort)
+                {
+                    if (IPAddress.TryParse(Settings.UdpIpAddress, out IPAddress ip))
+                    {
+                        _cachedEndpoint = new IPEndPoint(ip, Settings.UdpPort);
+                        _cachedIp = Settings.UdpIpAddress;
+                        _cachedPort = Settings.UdpPort;
+                    }
+                    else
+                    {
+                        _cachedEndpoint = null;
+                    }
+                }
+                if (_cachedEndpoint != null)
+                {
+                    _udp.Send(dataBytes, dataBytes.Length, _cachedEndpoint);
+                }
+                else
+                {
+                    _udp.Send(dataBytes, dataBytes.Length, Settings.UdpIpAddress, Settings.UdpPort);
+                }
             }
             catch (Exception ex)
             {
-                SimHub.Logging.Current.Error($"Traffic Light Plugin: Failed to send UDP packet. {ex.Message}");
-                _settingsControl?.Dispatcher.BeginInvoke(new Action(() => _settingsControl.UpdateStatus($"Error: {ex.Message}")));
+                if ((DateTime.UtcNow - _lastErrorLog).TotalSeconds >= 5.0)
+                {
+                    _lastErrorLog = DateTime.UtcNow;
+                    SimHub.Logging.Current.Error($"Traffic Light Plugin: Failed to send UDP packet. {ex.Message}");
+                    _settingsControl?.Dispatcher.BeginInvoke(new Action(() => _settingsControl.UpdateStatus($"Error: {ex.Message}")));
+                }
             }
         }
 
