@@ -24,7 +24,7 @@ yellow, or green in the end.
 - Updates push to the browser over Server-Sent Events instead of polling,
   because even a novelty desktop light deserves not to murder your
   phone's battery.
-- One Python file. No framework, no build step, no npm anywhere near this.
+- Plain Python and one static page. No framework, no build step, no npm anywhere near this.
 - A SimHub plugin lives in [`simhub-plugin/`](simhub-plugin) so any game
   SimHub reads (iRacing, AC EVO, ACC, LMU, ...) can yell at the lights
   directly, start lights and flags, a live shift-light rev bar, or your
@@ -64,8 +64,8 @@ of doing anything useful.
 ## Hardware
 
 Three LEDs (or a relay board) on the Pi's GPIO, active-low: Red on 22,
-Yellow on 27, Green on 17. Change pins/polarity at the top of
-`traffic_light_single.py`. No Pi, no wiring, wrong pins, it quietly
+Yellow on 27, Green on 17. Change pins/polarity in
+`trafficlight/config.py`. No Pi, no wiring, wrong pins, it quietly
 switches to fake hardware so the web UI still works and lies to you
 gracefully.
 
@@ -75,7 +75,7 @@ gracefully.
 git clone https://github.com/tiagofranzen/pi-traffic-light.git
 cd pi-traffic-light
 pip install -r requirements.txt   # add --break-system-packages if Raspberry Pi OS is feeling precious
-python3 traffic_light_single.py
+python3 traffic_light.py
 ```
 
 Open `http://<pi-ip>:8000`. Add it to your phone's home screen if you
@@ -95,6 +95,16 @@ The Clock bells play through PipeWire, PulseAudio or ALSA, whichever the
 Pi has. `CHIME_VOLUME` (0-1, default 0.5) is the starting volume until you
 set one in the UI; `CHIME_PLAYER` picks the player yourself, e.g.
 `aplay -D plughw:CARD=UC`.
+
+## Where things are
+
+- `traffic_light.py` starts it all.
+- `trafficlight/` is the Pi side, one module per tile: `clock.py`,
+  `weather.py`, `commute.py`, `party.py`, `racing.py`, `gremio.py`, plus
+  `modes.py` (traffic light, blinking, SOS), `controller.py` (the loop that
+  runs the active mode), `web.py`, `state.py`, `hardware.py`, `net.py` and
+  `config.py`. Each tile's settings sit at the top of its own module.
+- `web/` is the page: `index.html`, `style.css`, `app.js`.
 
 ## Running the SimHub side
 
