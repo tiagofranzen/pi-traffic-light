@@ -3,10 +3,9 @@ from __future__ import annotations
 import os
 import logging
 from datetime import datetime, timedelta
-import requests
 from typing import Dict, Optional, Tuple
 from .config import API_TIMEOUT
-from .net import _poll
+from .net import _poll, http
 
 SPACE_POLL_INTERVAL = 900.0
 ENVIRONMENT_POLL_INTERVAL = 600.0   # also feeds Temperature and Rain, so keep it fresh
@@ -80,7 +79,7 @@ def handle_rain_mode(controller, elapsed: float) -> Optional[float]:
 
 def _fetch_space() -> Dict:
     try:
-        r = requests.get(SPACE_WEATHER_URL, timeout=API_TIMEOUT); r.raise_for_status(); data = r.json()
+        r = http().get(SPACE_WEATHER_URL, timeout=API_TIMEOUT); r.raise_for_status(); data = r.json()
         if not data:
             return {}
         latest = data[-1]
@@ -158,7 +157,7 @@ def _fetch_environment() -> Dict:
     result: Dict = {}
     # Forecast: UV index + is_day + sunrise/sunset
     try:
-        r = requests.get(
+        r = http().get(
             OPEN_METEO_FORECAST_URL,
             params={
                 'latitude': WEATHER_LAT,
@@ -201,7 +200,7 @@ def _fetch_environment() -> Dict:
 
     # Air quality + pollen
     try:
-        r = requests.get(
+        r = http().get(
             OPEN_METEO_AIR_QUALITY_URL,
             params={
                 'latitude': WEATHER_LAT,

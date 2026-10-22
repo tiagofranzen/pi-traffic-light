@@ -1,5 +1,7 @@
 """Networking helpers: the shared polling loop and the network monitor."""
 from __future__ import annotations
+import threading
+import requests
 import os
 import logging
 from time import time, sleep
@@ -8,6 +10,15 @@ import struct
 import ipaddress
 from typing import Optional
 from .config import NETWORK_POLL_INTERVAL, POLL_RETRY_SECONDS, POLL_STALE_INTERVALS
+
+_sessions = threading.local()
+
+def http() -> requests.Session:
+    """This thread's HTTP session: keeps connections to the APIs open between polls
+    instead of a new connection and TLS handshake for every request."""
+    if not hasattr(_sessions, 's'):
+        _sessions.s = requests.Session()
+    return _sessions.s
 
 def _poll(controller, name: str, fetch, interval: float, store) -> None:
     """Calls fetch() every interval and hands a good (non-empty) result to store() under the lock.

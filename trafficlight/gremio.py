@@ -1,10 +1,9 @@
 """Grêmio mode: the last result and next match from ESPN."""
 from __future__ import annotations
 import logging
-import requests
 from typing import Dict, Optional
 from .config import API_TIMEOUT
-from .net import _poll
+from .net import _poll, http
 
 GREMIO_POLL_INTERVAL = 3600.0
 GREMIO_ESPN_TEAM_ID = "6273"
@@ -45,7 +44,7 @@ def _fetch_gremio_last_result() -> Dict:
     best_ev, best_competitors = None, None
     for league in GREMIO_ESPN_LEAGUES:
         try:
-            r = requests.get(_gremio_schedule_url(league), timeout=API_TIMEOUT)
+            r = http().get(_gremio_schedule_url(league), timeout=API_TIMEOUT)
             r.raise_for_status()
             events = sorted(r.json().get('events') or [], key=lambda e: e.get('date') or '', reverse=True)
             for ev in events:
@@ -85,7 +84,7 @@ def _fetch_gremio_last_result() -> Dict:
     best_next, best_next_competitors = None, None
     for league in GREMIO_ESPN_LEAGUES:
         try:
-            r = requests.get(_gremio_schedule_url(league), params={'fixture': 'true'}, timeout=API_TIMEOUT)
+            r = http().get(_gremio_schedule_url(league), params={'fixture': 'true'}, timeout=API_TIMEOUT)
             r.raise_for_status()
             events = sorted(r.json().get('events') or [], key=lambda e: e.get('date') or '')
             for ev in events:

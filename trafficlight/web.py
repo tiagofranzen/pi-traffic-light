@@ -2,12 +2,13 @@
 from __future__ import annotations
 import os
 import logging
-from time import time, sleep
+import threading
+from time import sleep
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
-from typing import TYPE_CHECKING, Dict
+from typing import TYPE_CHECKING, Dict, Tuple
 from .clock import CLOCK_QUIET_HOURS
 if TYPE_CHECKING:
     from .controller import TrafficLightController
@@ -47,21 +48,16 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-cache')
         self.send_header('Connection', 'keep-alive')
         self.end_headers()
-        last_payload = None; last_write = 0.0
+        seen = -1
         try:
             while self.controller.state.running:
-                # Check 20x a second but only write when something changed, plus a
-                # keepalive now and then, so an idle phone's radio can sleep.
-                payload = json.dumps(self.controller.get_status()); now = time()
-                if payload != last_payload:
-                    self.wfile.write(f"data: {payload}\n\n".encode())
-                    last_payload = payload
-                elif now - last_write >= SSE_KEEPALIVE_SECONDS:
+                # Sleeps until the status changes; a keepalive now and then, so an idle phone's radio can sleep.
+                version, payload = _status_feed.wait_newer(seen, SSE_KEEPALIVE_SECONDS)
+                if version == seen:
                     self.wfile.write(b": ping\n\n")
                 else:
-                    sleep(0.05); continue
-                self.wfile.flush(); last_write = now
-                sleep(0.05)
+                    self.wfile.write(f"data: {payload}\n\n".encode()); seen = version
+                self.wfile.flush()
         except OSError:  # browser gone: broken pipe, reset, timeout
             pass
     def _index(self,p):
@@ -112,8 +108,28 @@ class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+class _StatusFeed:
+    """Builds the status once every 50 ms for all browsers (instead of once per browser)
+    and wakes the event streams only when it changed."""
+    def __init__(self):
+        self.cond = threading.Condition(); self.version = 0; self.payload = ''
+    def run(self, controller: TrafficLightController) -> None:
+        while controller.state.running:
+            payload = json.dumps(controller.get_status())
+            if payload != self.payload:
+                with self.cond:
+                    self.payload = payload; self.version += 1; self.cond.notify_all()
+            sleep(0.05)
+    def wait_newer(self, seen: int, timeout: float) -> Tuple[int, str]:
+        with self.cond:
+            self.cond.wait_for(lambda: self.version != seen, timeout)
+            return self.version, self.payload
+
+_status_feed = _StatusFeed()
+
 def _start_web(controller: TrafficLightController):
     _Handler.controller = controller
+    threading.Thread(target=_status_feed.run, args=(controller,), name='status', daemon=True).start()
     srv = _ThreadingHTTPServer((WEB_SERVER_HOST, WEB_SERVER_PORT), _Handler)
     logging.info(f"Web server http://{WEB_SERVER_HOST}:{WEB_SERVER_PORT}")
     try:

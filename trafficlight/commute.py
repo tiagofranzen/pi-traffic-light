@@ -5,10 +5,9 @@ import logging
 from time import time, sleep
 from datetime import datetime, timedelta
 import xml.etree.ElementTree as ET
-import requests
 from typing import Dict, List, Optional, Tuple
 from .config import API_TIMEOUT
-from .net import _poll
+from .net import _poll, http
 
 S_BAHN_POLL_INTERVAL = 30.0
 S_BAHN_STALE_SECONDS = 300.0   # keep counting down from the last timetable this long when fetches fail
@@ -66,7 +65,7 @@ def handle_stau_mode(controller, elapsed: float) -> Optional[float]:
 def _db_get(path: str) -> Optional[bytes]:
     headers = {"DB-Client-Id": DB_CLIENT_ID, "DB-Api-Key": DB_CLIENT_SECRET, "accept": "application/xml"}
     try:
-        r = requests.get(f"{DB_API_URL}/{path}", headers=headers, timeout=API_TIMEOUT)
+        r = http().get(f"{DB_API_URL}/{path}", headers=headers, timeout=API_TIMEOUT)
         r.raise_for_status()
         return r.content
     except Exception as e:
@@ -157,7 +156,7 @@ def _fetch_transit_commute() -> Dict:
             'routingDateTimeIsArrival': 'false',
             'transportTypes': 'SCHIFF,UBAHN,TRAM,BUS,SBAHN,REGIONAL_BUS,BAHN',
         }
-        r = requests.get(MVG_ROUTES_URL, params=params, timeout=API_TIMEOUT)
+        r = http().get(MVG_ROUTES_URL, params=params, timeout=API_TIMEOUT)
         r.raise_for_status()
         routes_data = r.json() or []
         if not routes_data:
@@ -206,7 +205,7 @@ def _tomtom_geocode(address: str) -> Optional[Tuple[float, float]]:
     try:
         from urllib.parse import quote
         url = TOMTOM_GEOCODE_URL.format(query=quote(address))
-        r = requests.get(url, params={'key': TOMTOM_API_KEY, 'limit': 1}, timeout=API_TIMEOUT)
+        r = http().get(url, params={'key': TOMTOM_API_KEY, 'limit': 1}, timeout=API_TIMEOUT)
         r.raise_for_status()
         results = r.json().get('results') or []
         if not results:
@@ -242,7 +241,7 @@ def _fetch_traffic_tomtom() -> Dict:
                 'routeType': 'fastest',
                 'computeTravelTimeFor': 'all',
             }
-            r = requests.get(url, params=params, timeout=API_TIMEOUT)
+            r = http().get(url, params=params, timeout=API_TIMEOUT)
             r.raise_for_status()
             data = r.json()
             routes = data.get('routes') or []
@@ -273,7 +272,7 @@ def _fetch_traffic_google() -> Dict:
     for route in TRAFFIC_ROUTES:
         try:
             params = { 'origin': route['origin'], 'destination': route['destination'], 'key': GOOGLE_MAPS_API_KEY, 'departure_time': 'now' }
-            r = requests.get(GOOGLE_DIRECTIONS_URL, params=params, timeout=API_TIMEOUT); r.raise_for_status(); data = r.json()
+            r = http().get(GOOGLE_DIRECTIONS_URL, params=params, timeout=API_TIMEOUT); r.raise_for_status(); data = r.json()
             if data.get('status') != 'OK': continue
             leg = data['routes'][0]['legs'][0]; base = leg['duration']['value']; traffic_val = leg.get('duration_in_traffic', leg['duration'])['value']
             if base > 0: delays.append(((traffic_val - base)/base)*100)
