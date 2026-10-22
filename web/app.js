@@ -24,7 +24,7 @@ const SUBS = {
     emergency: {name: 'Blinking', rule: [['y', `blinks every ${CFG.blink_seconds} s`]]},
     sos: {name: 'SOS', rule: [['a', 'Morse SOS on all lamps']]},
     racing: {name: 'Revs', rule: [['g', 'shift light'], ['y', 'shift now (green + yellow)'], ['r', 'redline (all)']]},
-    race_start: {name: 'Start', rule: [['a', 'F1 start: 5 beeps, lamps fill, lights out'], ['y', 'yellow flag'], ['g', 'green flag']]},
+    race_start: {name: 'Start', rule: [['a', 'F1 start: 3 beeps light up, 4th beep lights out'], ['y', 'yellow flag'], ['g', 'green flag']]},
     hotlap: {name: 'Hotlap', rule: [['g', 'faster than your best lap'], ['y', 'slower'], ['r', 'lap invalid']]},
     party: {name: 'Music', rule: [['a', 'random lamp on every beat'], ['a', 'dark in silence']]},
     audio_vu: {name: 'VU meter', rule: [['g', 'quiet'], ['y', 'loud (green + yellow)'], ['r', 'very loud (all)']]},

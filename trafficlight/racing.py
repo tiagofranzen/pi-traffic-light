@@ -10,18 +10,17 @@ from .clock import CHIME_LATENCY_SECONDS, play_pcm, stop_chime
 SIMHUB_UDP_HOST = "0.0.0.0"
 SIMHUB_UDP_PORT = 9001
 
-# Formula 1 start gantry. As on the real grid, five lights come on one second apart,
-# each with the broadcast "beep-thump"; after a random 0.2-3 s hold they all go out
-# (silently - "lights out and away we go"). The light only has three lamps, so they
-# join on the 1st, 3rd and 5th beep and the gantry is full on the fifth, as in F1.
+# Formula 1 start gantry: three "beep-thumps" one second apart light the lamps
+# (red, +yellow, +green); after a random 0.2-3 s hold a fourth one puts them all
+# out - "lights out and away we go". With SimHub, the fourth comes with the game's
+# start signal instead.
 # The sound is modelled on a recording of the F1 start sound, measured per hit:
 #   - beep: 494.2 Hz (B4) for ~150 ms, faint 2nd/3rd harmonics (-20 dB);
 #   - thump: a kick-drum sweep from ~190 Hz down to 52.5 Hz within ~60 ms, held at
 #     full level and cut off at 332 ms;
 #   - the beep has about 0.7x the thump's energy in the first 120 ms.
-F1_LIGHTS = 5
+F1_LAMPS = ('red', 'red_and_yellow', 'all_on')  # one per beep
 F1_LIGHT_INTERVAL = 1.0
-F1_LAMP_STEPS = {0: 'red', 2: 'red_and_yellow', 4: 'all_on'}  # beep index -> lamps
 F1_HOLD_RANGE = (0.2, 3.0)     # FIA: random delay between the last light and lights out
 F1_GRID_PAUSE = 0.8            # silence before the first light
 F1_BEEP_HZ = 494.2
@@ -80,19 +79,24 @@ def play_f1_beeps(starts: List[float], volume: float) -> None:
         logging.warning("Racing: numpy missing, no F1 start sound"); return
     play_pcm(_render_f1_beeps(np, starts, volume))
 
-def start_f1_sequence(controller, hold: Optional[float] = None) -> None:
-    """Starts the Formula 1 start: five beeps a second apart (lamps join on the 1st, 3rd and 5th),
-    a random hold, then lights out."""
+def start_f1_sequence(controller, hold: Optional[float] = None, wait_for_go: bool = False) -> None:
+    """Starts the Formula 1 start: three beeps a second apart light the lamps, then after a random
+    hold a fourth beep puts them out. wait_for_go: hold up to `hold` s for the game's start signal,
+    which rings the fourth beep (see f1_lights_out)."""
     if hold is None:
         hold = round(random.uniform(*F1_HOLD_RANGE), 2)
     b = F1_LIGHT_INTERVAL; g = F1_GRID_PAUSE
-    seq = [('off', g)]
-    for i in range(F1_LIGHTS):
-        lamps = F1_LAMP_STEPS.get(i, seq[-1][0])
-        seq.append((lamps, hold if i == F1_LIGHTS - 1 else b))
-    seq.append(('off', 1.2))
-    play_f1_beeps([g + i * b for i in range(F1_LIGHTS)], controller.state.chime_volume)
+    beeps = [g + i * b for i in range(len(F1_LAMPS))]
+    seq = [('off', g)] + [(lamps, b) for lamps in F1_LAMPS[:-1]] + [(F1_LAMPS[-1], hold), ('off', 1.2)]
+    if not wait_for_go:
+        beeps.append(beeps[-1] + hold)  # the fourth beep: lights out
+    play_f1_beeps(beeps, controller.state.chime_volume)
     controller.state.mode_state.update(intro_seq=seq, intro_idx=-1, intro_until=time())
+
+def f1_lights_out(controller) -> None:
+    """The game gave the start: the fourth beep, and all lamps out."""
+    play_f1_beeps([CHIME_LATENCY_SECONDS], controller.state.chime_volume)  # right now (its latency offset cancels out)
+    controller.state.mode_state.update(intro_seq=[('off', 1.5)], intro_idx=-1, intro_until=time())
 
 def _play_intro(controller) -> Optional[float]:
     """Step through the sub-mode's intro; returns a sleep while it plays, None once it's done."""
@@ -135,12 +139,11 @@ def handle_race_start_mode(controller, elapsed: float) -> Optional[float]:
         ms['race_prev_flag'] = flag
         if flag == 'red':
             # Standing start lights on in the sim: build up the 3 lights with F1 beeps and hold on the grid.
-            start_f1_sequence(controller, hold=12.0)
+            start_f1_sequence(controller, hold=12.0, wait_for_go=True)
             return 0.02
         if prev_flag == 'red' and flag in ('green', 'black'):
-            # Lights out and away we go! Extinguish all lamps at the start signal.
-            stop_chime()
-            ms.update(intro_seq=[('off', 1.5)], intro_idx=-1, intro_until=now)
+            # Lights out and away we go: the fourth beep, all lamps out.
+            f1_lights_out(controller)
     intro = _play_intro(controller)
     if intro is not None:
         return intro
