@@ -10,16 +10,27 @@ from .clock import CHIME_LATENCY_SECONDS, play_pcm, stop_chime
 SIMHUB_UDP_HOST = "0.0.0.0"
 SIMHUB_UDP_PORT = 9001
 
-# Formula 1 start gantry (F1 TV broadcast sound): 3 lamps light up 1 s apart, each
-# with a crisp 120 ms 494 Hz (B4) beep layered over a 340 ms 80->52.5 Hz bass thud,
-# hold for a random 1.2–2.5 s pause, then all snap off ("Lights out!").
-F1_BEEP_HZ = 494.0
-F1_BEEP_SECONDS = 0.125
-F1_THUD_SECONDS = 0.34
-F1_GRID_PAUSE = 0.8
+# Formula 1 start gantry. As on the real grid, five lights come on one second apart,
+# each with the broadcast "beep-thump"; after a random 0.2-3 s hold they all go out
+# (silently - "lights out and away we go"). The light only has three lamps, so they
+# join on the 1st, 3rd and 5th beep and the gantry is full on the fifth, as in F1.
+# The sound is modelled on a recording of the F1 start sound, measured per hit:
+#   - beep: 494.2 Hz (B4) for ~150 ms, faint 2nd/3rd harmonics (-20 dB);
+#   - thump: a kick-drum sweep from ~190 Hz down to 52.5 Hz within ~60 ms, held at
+#     full level and cut off at 332 ms;
+#   - the beep has about 0.7x the thump's energy in the first 120 ms.
+F1_LIGHTS = 5
 F1_LIGHT_INTERVAL = 1.0
-F1_HOLD_RANGE = (1.2, 2.5)
-_F1_BEEP_HARMONICS = ((1.0, 1.0), (2.0, 0.11), (3.0, 0.09))
+F1_LAMP_STEPS = {0: 'red', 2: 'red_and_yellow', 4: 'all_on'}  # beep index -> lamps
+F1_HOLD_RANGE = (0.2, 3.0)     # FIA: random delay between the last light and lights out
+F1_GRID_PAUSE = 0.8            # silence before the first light
+F1_BEEP_HZ = 494.2
+F1_BEEP_SECONDS = 0.15
+F1_BEEP_HARMONICS = ((1.0, 1.0), (2.0, 0.1), (3.0, 0.08))
+F1_THUMP_HZ = (190.0, 52.5)    # sweep start -> settled pitch
+F1_THUMP_SWEEP_SECONDS = 0.02  # time constant of that sweep
+F1_HIT_SECONDS = 0.332         # the whole hit, thump cut off at the end
+F1_BEEP_TO_THUMP = 0.46   # balance measured against the recording (beep/thump energy 0.68 in the first 120 ms)
 
 # Intro played when a Racing sub-mode is selected: (lamps, seconds) steps.
 # One rev to the limiter: quick climb, hold on redline, drop back, short breath.
@@ -34,19 +45,22 @@ HOTLAP_DEADBAND = 0.03       # +-s around 0 where the colour holds, so being exa
 HOTLAP_MIN_SWITCH = 0.25     # s between green/yellow changes (red always switches at once)
 SIMHUB_STALE_SECONDS = 2.0   # no packet from the plugin for this long (game closed) -> Racing lights off
 
+def _f1_hit(np, rate: int):
+    """One gantry light: the beep over the thump (see F1_* config)."""
+    tt = np.arange(int(F1_HIT_SECONDS * rate)) / rate
+    def gate(length, fade):  # 2 ms attack, flat, short fade at the end: no clicks
+        return np.minimum(tt / 0.002, 1.0) * np.clip((length - tt) / fade, 0.0, 1.0)
+    beep = sum(a * np.sin(2 * np.pi * F1_BEEP_HZ * r * tt) for r, a in F1_BEEP_HARMONICS) * gate(F1_BEEP_SECONDS, 0.02)
+    lo, hi = F1_THUMP_HZ[1], F1_THUMP_HZ[0]; tau = F1_THUMP_SWEEP_SECONDS
+    phase = 2 * np.pi * (lo * tt + (hi - lo) * tau * (1.0 - np.exp(-tt / tau)))  # pitch sweeps hi -> lo
+    # A little saturation adds the overtones that let small speakers suggest the 52 Hz they can't play.
+    thump = np.tanh(1.6 * np.sin(phase)) / np.tanh(1.6) * gate(F1_HIT_SECONDS, 0.012)
+    rms = lambda x: float(np.sqrt(np.mean(x ** 2))) or 1.0
+    return thump / rms(thump) + beep / rms(beep) * F1_BEEP_TO_THUMP
+
 def _render_f1_beeps(np, starts: List[float], volume: float, rate: int = 44100):
-    tt = np.arange(int(F1_THUD_SECONDS * rate)) / rate
-    # Layer 1: 125 ms 494 Hz (B4) gantry beep with sharp initial transient and clean 15 ms tail.
-    beep_env = np.minimum(tt / 0.004, 1.0) * (1.0 + 0.55 * np.exp(-tt / 0.015))
-    beep_env *= np.sin(np.clip((F1_BEEP_SECONDS - tt) / 0.015, 0.0, 1.0) * np.pi / 2) ** 2
-    beep = sum(a * np.sin(2 * np.pi * F1_BEEP_HZ * r * tt) for r, a in _F1_BEEP_HARMONICS) * beep_env
-    # Layer 2: 340 ms 80 -> 52.5 Hz pitch-drop impact boom (+ upper bass harmonics for speaker punch).
-    phase = 2 * np.pi * (52.5 * tt + 27.5 * 0.025 * (1.0 - np.exp(-tt / 0.025)))
-    thud_env = np.minimum(tt / 0.005, 1.0) * np.exp(-tt / 0.32)
-    thud_env *= np.sin(np.clip((F1_THUD_SECONDS - tt) / 0.045, 0.0, 1.0) * np.pi / 2) ** 2
-    thud = (np.sin(phase) + 0.45 * np.sin(2 * phase) + 0.20 * np.sin(3 * phase)) * thud_env
-    hit = 0.58 * beep + 0.72 * thud
-    end = max(starts) + F1_THUD_SECONDS + 0.1
+    hit = _f1_hit(np, rate)
+    end = max(starts) + F1_HIT_SECONDS + 0.1
     out = np.zeros(int(end * rate), dtype=np.float64)
     for s in starts:
         i = max(0, int((s - CHIME_LATENCY_SECONDS) * rate))
@@ -67,12 +81,17 @@ def play_f1_beeps(starts: List[float], volume: float) -> None:
     play_pcm(_render_f1_beeps(np, starts, volume))
 
 def start_f1_sequence(controller, hold: Optional[float] = None) -> None:
-    """Starts the Formula 1 light sequence (red -> +yellow -> +green -> hold -> lights out) with F1 beeps."""
+    """Starts the Formula 1 start: five beeps a second apart (lamps join on the 1st, 3rd and 5th),
+    a random hold, then lights out."""
     if hold is None:
         hold = round(random.uniform(*F1_HOLD_RANGE), 2)
     b = F1_LIGHT_INTERVAL; g = F1_GRID_PAUSE
-    seq = [('off', g), ('red', b), ('red_and_yellow', b), ('all_on', hold), ('off', 1.2)]
-    play_f1_beeps([g, g + b, g + 2 * b], controller.state.chime_volume)
+    seq = [('off', g)]
+    for i in range(F1_LIGHTS):
+        lamps = F1_LAMP_STEPS.get(i, seq[-1][0])
+        seq.append((lamps, hold if i == F1_LIGHTS - 1 else b))
+    seq.append(('off', 1.2))
+    play_f1_beeps([g + i * b for i in range(F1_LIGHTS)], controller.state.chime_volume)
     controller.state.mode_state.update(intro_seq=seq, intro_idx=-1, intro_until=time())
 
 def _play_intro(controller) -> Optional[float]:
